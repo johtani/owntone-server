@@ -461,7 +461,6 @@
         "show-composer": "Show composer",
         "show-coverart": "Show cover artwork in album list",
         "show-path": "Show Filepath on the \"Now playing\" page"
-
       },
       "services": {
         "lastfm": {
