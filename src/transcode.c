@@ -361,7 +361,7 @@ init_settings(struct settings_ctx *settings, enum transcode_profile profile, str
       av_channel_layout_default(&settings->channel_layout, quality->channels);
 #else
       settings->channel_layout = av_get_default_channel_layout(quality->channels);
-      settings->channels       = quality->channels;
+      settings->nb_channels    = quality->channels;
 #endif
     }
 
@@ -448,7 +448,7 @@ stream_settings_set(struct stream_ctx *s, struct settings_ctx *settings, enum AV
       av_channel_layout_copy(&s->codec->ch_layout, &(settings->channel_layout));
 #else
       s->codec->channel_layout = settings->channel_layout;
-      s->codec->channels       = settings->channels;
+      s->codec->channels       = settings->nb_channels;
 #endif
       s->codec->sample_fmt     = settings->sample_format;
       s->codec->time_base      = (AVRational){1, settings->sample_rate};
