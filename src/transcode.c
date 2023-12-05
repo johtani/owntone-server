@@ -63,8 +63,10 @@
 #define WAV_HEADER_LEN 44
 // Max filters in a filtergraph
 #define MAX_FILTERS 9
+// Set to same size as in httpd.c (but can be set to something else)
+#define STREAM_CHUNK_SIZE (64 * 1024)
 
-static const char *default_codecs = "mpeg,wav";
+static const char *default_codecs = "mpeg,alac,wav";
 static const char *roku_codecs = "mpeg,mp4a,wma,alac,wav";
 static const char *itunes_codecs = "mpeg,mp4a,mp4v,alac,wav";
 
@@ -93,8 +95,8 @@ struct settings_ctx
   AVChannelLayout channel_layout;
 #else
   uint64_t channel_layout;
-  int channels;
 #endif
+  int nb_channels;
   int bit_rate;
   int frame_size;
   enum AVSampleFormat sample_format;
@@ -289,6 +291,12 @@ init_settings(struct settings_ctx *settings, enum transcode_profile profile, str
 	settings->frame_size = 352;
 	break;
 
+      case XCODE_MP4:
+	settings->encode_audio = true;
+	settings->format = "mp4";
+	settings->audio_codec = AV_CODEC_ID_ALAC;
+	break;
+
       case XCODE_OGG:
 	settings->encode_audio = true;
 	settings->in_format = "ogg";
@@ -366,6 +374,65 @@ init_settings(struct settings_ctx *settings, enum transcode_profile profile, str
     {
       DPRINTF(E_LOG, L_XCODE, "Bug! Mismatch between profile (%d bps) and media quality (%d bps)\n", 8 * av_get_bytes_per_sample(settings->sample_format), quality->bits_per_sample);
       return -1;
+    }
+
+  return 0;
+}
+
+static int
+init_settings_from_video(struct settings_ctx *settings, enum transcode_profile profile, struct decode_ctx *src_ctx, int width, int height)
+{
+  settings->width = width;
+  settings->height = height;
+
+  return 0;
+}
+
+static int
+init_settings_from_audio(struct settings_ctx *settings, enum transcode_profile profile, struct decode_ctx *src_ctx, struct media_quality *quality)
+{
+  int src_bytes_per_sample = av_get_bytes_per_sample(src_ctx->audio_stream.codec->sample_fmt);
+
+  // Initialize unset settings that are source-dependent, not profile-dependent
+  if (!settings->sample_rate)
+    settings->sample_rate = src_ctx->audio_stream.codec->sample_rate;
+
+#if USE_CH_LAYOUT
+  if (!av_channel_layout_check(&settings->channel_layout))
+    av_channel_layout_copy(&settings->channel_layout, &src_ctx->audio_stream.codec->ch_layout);
+
+  settings->nb_channels = settings->channel_layout.nb_channels;
+#else
+  if (settings->nb_channels == 0)
+    {
+      settings->nb_channels = src_ctx->audio_stream.codec->channels;
+      settings->channel_layout = src_ctx->audio_stream.codec->channel_layout;
+    }
+#endif
+
+  // Initialize settings that are both source-dependent and profile-dependent
+  switch (profile)
+    {
+      case XCODE_MP4:
+	if (!settings->sample_format)
+	  settings->sample_format = (src_bytes_per_sample == 4) ? AV_SAMPLE_FMT_S32P : AV_SAMPLE_FMT_S16P;
+	break;
+
+      case XCODE_PCM_NATIVE:
+	if (!settings->sample_format)
+	  settings->sample_format = (src_bytes_per_sample == 4) ? AV_SAMPLE_FMT_S32 : AV_SAMPLE_FMT_S16;
+	if (!settings->audio_codec)
+	  settings->audio_codec = (src_bytes_per_sample == 4) ? AV_CODEC_ID_PCM_S32LE : AV_CODEC_ID_PCM_S16LE;
+	if (!settings->format)
+	  settings->format = (src_bytes_per_sample == 4) ? "s32le" : "s16le";
+	break;
+
+      default:
+	if (settings->sample_format && settings->audio_codec && settings->format)
+	  return 0;
+
+	DPRINTF(E_LOG, L_XCODE, "Bug! Profile %d has unset encoding parameters\n", profile);
+	return -1;
     }
 
   return 0;
@@ -474,6 +541,8 @@ size_estimate(enum transcode_profile profile, int bit_rate, int sample_rate, int
     bytes = (int64_t)len_ms * channels * bytes_per_sample * sample_rate / 1000 + WAV_HEADER_LEN;
   else if (profile == XCODE_MP3)
     bytes = (int64_t)len_ms * bit_rate / 8000;
+  else if (profile == XCODE_MP4)
+    bytes = (int64_t)len_ms * channels * bytes_per_sample * sample_rate / 1000 / 2; // FIXME
   else
     bytes = -1;
 
@@ -1187,6 +1256,7 @@ open_output(struct encode_ctx *ctx, struct decode_ctx *src_ctx)
   // Not const before ffmpeg 5.0
   AVOutputFormat *oformat;
 #endif
+  AVDictionary *options = NULL;
   int ret;
 
   oformat = av_guess_format(ctx->settings.format, NULL, NULL);
@@ -1236,12 +1306,28 @@ open_output(struct encode_ctx *ctx, struct decode_ctx *src_ctx)
 	goto out_free_streams;
     }
 
+  // By default ffmpeg can't mux mp4 to a stream, since it is non-seekable, and
+  // normally the muxing involves writing some header bytes when the encoding is
+  // completed. This is solution for that found on stackoverflow. "movflags" set
+  // to "empty_moov" was also suggested, but it doesn't seem required.
+  if (strcmp("mp4", oformat->name) == 0)
+    {
+      av_dict_set_int(&options, "frag_size", STREAM_CHUNK_SIZE, 0);
+//      av_dict_set(&options, "movflags", "empty_moov", 0);
+    }
+
   // Notice, this will not write WAV header (so we do that manually)
-  ret = avformat_write_header(ctx->ofmt_ctx, NULL);
+  ret = avformat_write_header(ctx->ofmt_ctx, &options);
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_XCODE, "Error writing header to output buffer: %s\n", err2str(ret));
       goto out_free_streams;
+    }
+
+  if (options)
+    {
+      DPRINTF(E_WARN, L_XCODE, "Didn't recognize all options given to avformat_write_header\n");
+      av_dict_free(&options);
     }
 
   if (ctx->settings.with_wav_header)
@@ -1631,71 +1717,30 @@ struct encode_ctx *
 transcode_encode_setup(enum transcode_profile profile, struct media_quality *quality, struct decode_ctx *src_ctx, int width, int height)
 {
   struct encode_ctx *ctx;
-  int src_bytes_per_sample;
   int dst_bytes_per_sample;
-  int channels;
 
   CHECK_NULL(L_XCODE, ctx = calloc(1, sizeof(struct encode_ctx)));
   CHECK_NULL(L_XCODE, ctx->filt_frame = av_frame_alloc());
   CHECK_NULL(L_XCODE, ctx->encoded_pkt = av_packet_alloc());
 
+  // Initialize general settings
   if (init_settings(&ctx->settings, profile, quality) < 0)
     goto fail_free;
 
-  ctx->settings.width = width;
-  ctx->settings.height = height;
+  if (ctx->settings.encode_audio && init_settings_from_audio(&ctx->settings, profile, src_ctx, quality) < 0)
+    goto fail_free;
 
-  // Caller did not specify a sample rate -> use same as source
-  if (!ctx->settings.sample_rate && ctx->settings.encode_audio)
-    {
-      ctx->settings.sample_rate = src_ctx->audio_stream.codec->sample_rate;
-    }
-
-  // Caller did not specify a sample format -> determine from source
-  if (!ctx->settings.sample_format && ctx->settings.encode_audio)
-    {
-      src_bytes_per_sample = av_get_bytes_per_sample(src_ctx->audio_stream.codec->sample_fmt);
-      if (src_bytes_per_sample == 4)
-	{
-	  ctx->settings.sample_format = AV_SAMPLE_FMT_S32;
-	  ctx->settings.audio_codec = AV_CODEC_ID_PCM_S32LE;
-	  ctx->settings.format = "s32le";
-	}
-      else
-	{
-	  ctx->settings.sample_format = AV_SAMPLE_FMT_S16;
-	  ctx->settings.audio_codec = AV_CODEC_ID_PCM_S16LE;
-	  ctx->settings.format = "s16le";
-	}
-    }
-
-#if USE_CH_LAYOUT
-  // Caller did not specify channels -> use same as source
-  if (!av_channel_layout_check(&ctx->settings.channel_layout) && ctx->settings.encode_audio)
-    {
-      av_channel_layout_copy(&ctx->settings.channel_layout, &src_ctx->audio_stream.codec->ch_layout);
-    }
-
-  channels = ctx->settings.channel_layout.nb_channels;
-#else
-  // Caller did not specify channels -> use same as source
-  if (ctx->settings.channels == 0 && ctx->settings.encode_audio)
-    {
-      ctx->settings.channels = src_ctx->audio_stream.codec->channels;
-      ctx->settings.channel_layout = src_ctx->audio_stream.codec->channel_layout;
-    }
-
-  channels = ctx->settings.channels;
-#endif
+  if (ctx->settings.encode_video && init_settings_from_video(&ctx->settings, profile, src_ctx, width, height) < 0)
+    goto fail_free;
 
   dst_bytes_per_sample = av_get_bytes_per_sample(ctx->settings.sample_format);
 
-  ctx->bytes_total = size_estimate(profile, ctx->settings.bit_rate, ctx->settings.sample_rate, dst_bytes_per_sample, channels, src_ctx->len_ms);
+  ctx->bytes_total = size_estimate(profile, ctx->settings.bit_rate, ctx->settings.sample_rate, dst_bytes_per_sample, ctx->settings.nb_channels, src_ctx->len_ms);
 
   if (ctx->settings.with_wav_header)
-    make_wav_header(ctx->wav_header, ctx->settings.sample_rate, dst_bytes_per_sample, channels, ctx->bytes_total);
+    make_wav_header(ctx->wav_header, ctx->settings.sample_rate, dst_bytes_per_sample, ctx->settings.nb_channels, ctx->bytes_total);
   if (ctx->settings.with_icy && src_ctx->data_kind == DATA_KIND_HTTP)
-    ctx->icy_interval = METADATA_ICY_INTERVAL * channels * dst_bytes_per_sample * ctx->settings.sample_rate;
+    ctx->icy_interval = METADATA_ICY_INTERVAL * ctx->settings.nb_channels * dst_bytes_per_sample * ctx->settings.sample_rate;
 
   if (open_output(ctx, src_ctx) < 0)
     goto fail_free;
@@ -1804,9 +1849,13 @@ transcode_decode_setup_raw(enum transcode_profile profile, struct media_quality 
 enum transcode_profile
 transcode_needed(const char *user_agent, const char *client_codecs, char *file_codectype)
 {
-  char *codectype;
+  const char *codectype;
+  const char *prefer_format;
   cfg_t *lib;
   bool force_xcode;
+  bool supports_alac;
+  bool supports_mpeg;
+  bool supports_wav;
   int count;
   int i;
 
@@ -1862,10 +1911,28 @@ transcode_needed(const char *user_agent, const char *client_codecs, char *file_c
 
   if (!force_xcode && strstr(client_codecs, file_codectype))
     return XCODE_NONE;
-  else if (strstr(client_codecs, "mpeg"))
-    return XCODE_MP3;
-  else if (strstr(client_codecs, "wav"))
+
+  supports_alac = strstr(client_codecs, "alac") || strstr(client_codecs, "mp4a");
+  supports_mpeg = strstr(client_codecs, "mpeg");
+  supports_wav = strstr(client_codecs, "wav");
+
+  prefer_format = cfg_getstr(lib, "prefer_format");
+  if (prefer_format)
+    {
+      if (strcmp(prefer_format, "alac") == 0 && supports_alac)
+	return XCODE_MP4;
+      else if (strcmp(prefer_format, "wav") == 0 && supports_wav)
+	return XCODE_WAV;
+      else if (strcmp(prefer_format, "mpeg") == 0 && supports_mpeg)
+	return XCODE_MP3;
+    }
+
+  if (supports_alac)
+    return XCODE_MP4;
+  else if (supports_wav)
     return XCODE_WAV;
+  else if (supports_mpeg)
+    return XCODE_MP3;
   else
     return XCODE_UNKNOWN;
 }

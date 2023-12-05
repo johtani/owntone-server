@@ -710,6 +710,16 @@ rsp_stream(struct httpd_request *hreq)
 //  /rsp/stream/36364
 //  /rsp/db/0?query=id%3D36365&type=full
 //  /rsp/stream/36365
+//
+// Headers sent from Roku M2000 and M1001 in stream requests (and other?):
+//
+// 'User-Agent': 'Roku SoundBridge/3.0'
+// 'Host': '192.168.1.119:3689'
+// 'Accept': '*/*'
+// 'Pragma': 'no-cache'
+// 'accept-codecs': 'wma,mpeg,wav,mp4a,alac'
+// 'rsp-version': '0.1'
+// 'transcode-codecs': 'wav,mp3'
 static struct httpd_uri_map rsp_handlers[] =
   {
     {

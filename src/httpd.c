@@ -119,6 +119,7 @@ static const struct content_type_map ext2ctype[] =
     { ".png",  XCODE_PNG,  "image/png" },
     { ".jpg",  XCODE_JPEG, "image/jpeg" },
     { ".mp3",  XCODE_MP3,  "audio/mpeg" },
+    { ".m4a",  XCODE_MP4,  "audio/mp4" },
     { ".wav",  XCODE_WAV,  "audio/wav" },
     { NULL,    XCODE_NONE, NULL }
   };
@@ -678,7 +679,7 @@ stream_new_transcode(struct media_file_info *mfi, enum transcode_profile profile
                      int64_t offset, int64_t end_offset, event_callback_fn stream_cb)
 {
   struct stream_ctx *st;
-  struct media_quality quality = { HTTPD_STREAM_SAMPLE_RATE, HTTPD_STREAM_BPS, HTTPD_STREAM_CHANNELS, HTTPD_STREAM_BIT_RATE };
+//  struct media_quality quality = { HTTPD_STREAM_SAMPLE_RATE, HTTPD_STREAM_BPS, HTTPD_STREAM_CHANNELS, HTTPD_STREAM_BIT_RATE };
 
   st = stream_new(mfi, hreq, stream_cb);
   if (!st)
@@ -686,7 +687,7 @@ stream_new_transcode(struct media_file_info *mfi, enum transcode_profile profile
       goto error;
     }
 
-  st->xcode = transcode_setup(profile, &quality, mfi->data_kind, mfi->path, mfi->song_length);
+  st->xcode = transcode_setup(profile, NULL, mfi->data_kind, mfi->path, mfi->song_length);
   if (!st->xcode)
     {
       DPRINTF(E_WARN, L_HTTPD, "Transcoding setup failed, aborting streaming\n");
