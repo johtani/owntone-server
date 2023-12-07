@@ -61,6 +61,8 @@
 #define AVIO_BUFFER_SIZE 4096
 // Size of the wav header that iTunes needs
 #define WAV_HEADER_LEN 44
+// Size of the mp4 header that iTunes needs
+#define MP4_HEADER_LEN 44
 // Max filters in a filtergraph
 #define MAX_FILTERS 9
 // Set to same size as in httpd.c (but can be set to something else)
@@ -100,6 +102,7 @@ struct settings_ctx
   int bit_rate;
   int frame_size;
   enum AVSampleFormat sample_format;
+  bool with_mp4_header;
   bool with_wav_header;
   bool with_icy;
   bool with_user_filters;
@@ -199,6 +202,9 @@ struct encode_ctx
 
   // WAV header
   uint8_t wav_header[WAV_HEADER_LEN];
+
+  // MP4 header
+  uint8_t mp4_header[MP4_HEADER_LEN];
 };
 
 enum probe_type
@@ -292,6 +298,7 @@ init_settings(struct settings_ctx *settings, enum transcode_profile profile, str
 	break;
 
       case XCODE_MP4:
+//	settings->with_mp4_header = true;
 	settings->encode_audio = true;
 	settings->format = "mp4";
 	settings->audio_codec = AV_CODEC_ID_ALAC;
@@ -524,6 +531,25 @@ make_wav_header(uint8_t *header, int sample_rate, int bytes_per_sample, int chan
   add_le32(header + 40, wav_size);
 }
 
+/*
+ * header must have size MP4_HEADER_LEN (44 bytes)
+
+....ftypM4A ....
+M4A isomiso2....
+free....mdat
+
+ */
+static void
+make_mp4_header(uint8_t *header, int sample_rate, int bytes_per_sample, int channels, off_t bytes_total)
+{
+const uint8_t fixed_mp4_header[] =
+  "\x00\x00\x00\x1c\x66\x74\x79\x70\x4d\x34\x41\x20\x00\x00\x02\x00"
+  "\x4d\x34\x41\x20\x69\x73\x6f\x6d\x69\x73\x6f\x32\x00\x00\x00\x08"
+  "\x66\x72\x65\x65\x01\xa8\xf5\x93\x6d\x64\x61\x74";
+
+  memcpy(header, fixed_mp4_header, MP4_HEADER_LEN);
+}
+
 static off_t
 size_estimate(enum transcode_profile profile, int bit_rate, int sample_rate, int bytes_per_sample, int channels, int len_ms)
 {
@@ -542,7 +568,7 @@ size_estimate(enum transcode_profile profile, int bit_rate, int sample_rate, int
   else if (profile == XCODE_MP3)
     bytes = (int64_t)len_ms * bit_rate / 8000;
   else if (profile == XCODE_MP4)
-    bytes = (int64_t)len_ms * channels * bytes_per_sample * sample_rate / 1000 / 2; // FIXME
+    bytes = (int64_t)len_ms * channels * bytes_per_sample * sample_rate / 1000 / 2 + MP4_HEADER_LEN; // FIXME
   else
     bytes = -1;
 
@@ -1334,6 +1360,10 @@ open_output(struct encode_ctx *ctx, struct decode_ctx *src_ctx)
     {
       evbuffer_add(ctx->obuf, ctx->wav_header, sizeof(ctx->wav_header));
     }
+  else if (ctx->settings.with_mp4_header)
+    {
+      evbuffer_add(ctx->obuf, ctx->mp4_header, sizeof(ctx->mp4_header));
+    }
 
   return 0;
 
@@ -1739,6 +1769,8 @@ transcode_encode_setup(enum transcode_profile profile, struct media_quality *qua
 
   if (ctx->settings.with_wav_header)
     make_wav_header(ctx->wav_header, ctx->settings.sample_rate, dst_bytes_per_sample, ctx->settings.nb_channels, ctx->bytes_total);
+  if (ctx->settings.with_mp4_header)
+    make_mp4_header(ctx->mp4_header, ctx->settings.sample_rate, dst_bytes_per_sample, ctx->settings.nb_channels, ctx->bytes_total);
   if (ctx->settings.with_icy && src_ctx->data_kind == DATA_KIND_HTTP)
     ctx->icy_interval = METADATA_ICY_INTERVAL * ctx->settings.nb_channels * dst_bytes_per_sample * ctx->settings.sample_rate;
 
