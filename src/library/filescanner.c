@@ -330,6 +330,9 @@ file_type_get(const char *path) {
   if ((strcasecmp(ext, ".jpg") == 0) || (strcasecmp(ext, ".png") == 0))
     return FILE_IGNORE;
 
+  if (strcasecmp(ext, ".mp4h") == 0)
+    return FILE_IGNORE;
+
   if (strcasecmp(ext, ".xml") == 0)
     return FILE_ITUNES;
 

@@ -25,6 +25,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <fcntl.h> // open() and O_RDONLY
+
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavfilter/avfilter.h>
@@ -61,8 +63,6 @@
 #define AVIO_BUFFER_SIZE 4096
 // Size of the wav header that iTunes needs
 #define WAV_HEADER_LEN 44
-// Size of the mp4 header that iTunes needs
-#define MP4_HEADER_LEN 44
 // Max filters in a filtergraph
 #define MAX_FILTERS 9
 // Set to same size as in httpd.c (but can be set to something else)
@@ -199,12 +199,6 @@ struct encode_ctx
   // Used to check for ICY metadata changes at certain intervals
   uint32_t icy_interval;
   uint32_t icy_hash;
-
-  // WAV header
-  uint8_t wav_header[WAV_HEADER_LEN];
-
-  // MP4 header
-  uint8_t mp4_header[MP4_HEADER_LEN];
 };
 
 enum probe_type
@@ -298,9 +292,9 @@ init_settings(struct settings_ctx *settings, enum transcode_profile profile, str
 	break;
 
       case XCODE_MP4:
-//	settings->with_mp4_header = true;
+	settings->with_mp4_header = true;
 	settings->encode_audio = true;
-	settings->format = "mp4";
+	settings->format = "data";
 	settings->audio_codec = AV_CODEC_ID_ALAC;
 	break;
 
@@ -512,42 +506,58 @@ add_le32(uint8_t *dst, uint32_t val)
 /*
  * header must have size WAV_HEADER_LEN (44 bytes)
  */
-static void
-make_wav_header(uint8_t *header, int sample_rate, int bytes_per_sample, int channels, off_t bytes_total)
+static int
+make_wav_header(struct evbuffer **header, int sample_rate, int bytes_per_sample, int channels, off_t bytes_total)
 {
+  uint8_t wav_header[WAV_HEADER_LEN];
+
   uint32_t wav_size = bytes_total - WAV_HEADER_LEN;
 
-  memcpy(header, "RIFF", 4);
-  add_le32(header + 4, 36 + wav_size);
-  memcpy(header + 8, "WAVEfmt ", 8);
-  add_le32(header + 16, 16);
-  add_le16(header + 20, 1);
-  add_le16(header + 22, channels);     /* channels */
-  add_le32(header + 24, sample_rate);  /* samplerate */
-  add_le32(header + 28, sample_rate * channels * bytes_per_sample); /* byte rate */
-  add_le16(header + 32, channels * bytes_per_sample);               /* block align */
-  add_le16(header + 34, 8 * bytes_per_sample);                      /* bits per sample */
-  memcpy(header + 36, "data", 4);
-  add_le32(header + 40, wav_size);
+  memcpy(wav_header, "RIFF", 4);
+  add_le32(wav_header + 4, 36 + wav_size);
+  memcpy(wav_header + 8, "WAVEfmt ", 8);
+  add_le32(wav_header + 16, 16);
+  add_le16(wav_header + 20, 1);
+  add_le16(wav_header + 22, channels);     /* channels */
+  add_le32(wav_header + 24, sample_rate);  /* samplerate */
+  add_le32(wav_header + 28, sample_rate * channels * bytes_per_sample); /* byte rate */
+  add_le16(wav_header + 32, channels * bytes_per_sample);               /* block align */
+  add_le16(wav_header + 34, 8 * bytes_per_sample);                      /* bits per sample */
+  memcpy(wav_header + 36, "data", 4);
+  add_le32(wav_header + 40, wav_size);
+
+  *header = evbuffer_new();
+  evbuffer_add(*header, wav_header, sizeof(wav_header));
+  return 0;
 }
 
-/*
- * header must have size MP4_HEADER_LEN (44 bytes)
-
-....ftypM4A ....
-M4A isomiso2....
-free....mdat
-
- */
-static void
-make_mp4_header(uint8_t *header, int sample_rate, int bytes_per_sample, int channels, off_t bytes_total)
+static int
+make_mp4_header(struct evbuffer **header, const char *url)
 {
-const uint8_t fixed_mp4_header[] =
-  "\x00\x00\x00\x1c\x66\x74\x79\x70\x4d\x34\x41\x20\x00\x00\x02\x00"
-  "\x4d\x34\x41\x20\x69\x73\x6f\x6d\x69\x73\x6f\x32\x00\x00\x00\x08"
-  "\x66\x72\x65\x65\x01\xa8\xf5\x93\x6d\x64\x61\x74";
+  char path[PATH_MAX];
+  uint8_t buf[4096];
+  int fd = -1;
+  int len;
 
-  memcpy(header, fixed_mp4_header, MP4_HEADER_LEN);
+  if (!url || *url != '/')
+    goto error;
+
+  snprintf(path, sizeof(path), "%s.mp4h", url);
+  fd = open(path, O_RDONLY);
+  if (fd < 0)
+    goto error;
+
+  *header = evbuffer_new();
+  while ((len = read(fd, buf, sizeof(buf))) > 0)
+    evbuffer_add(*header, buf, len);
+
+  close(fd);
+  return 0;
+
+ error:
+  if (fd >= 0)
+    close(fd);
+  return -1;
 }
 
 static off_t
@@ -568,7 +578,7 @@ size_estimate(enum transcode_profile profile, int bit_rate, int sample_rate, int
   else if (profile == XCODE_MP3)
     bytes = (int64_t)len_ms * bit_rate / 8000;
   else if (profile == XCODE_MP4)
-    bytes = (int64_t)len_ms * channels * bytes_per_sample * sample_rate / 1000 / 2 + MP4_HEADER_LEN; // FIXME
+    bytes = (int64_t)len_ms * channels * bytes_per_sample * sample_rate / 1000 / 2; // FIXME
   else
     bytes = -1;
 
@@ -1283,6 +1293,7 @@ open_output(struct encode_ctx *ctx, struct decode_ctx *src_ctx)
   AVOutputFormat *oformat;
 #endif
   AVDictionary *options = NULL;
+  struct evbuffer *header = NULL;
   int ret;
 
   oformat = av_guess_format(ctx->settings.format, NULL, NULL);
@@ -1357,12 +1368,21 @@ open_output(struct encode_ctx *ctx, struct decode_ctx *src_ctx)
     }
 
   if (ctx->settings.with_wav_header)
-    {
-      evbuffer_add(ctx->obuf, ctx->wav_header, sizeof(ctx->wav_header));
-    }
+    ret = make_wav_header(&header, ctx->settings.sample_rate, av_get_bytes_per_sample(ctx->settings.sample_format), ctx->settings.nb_channels, ctx->bytes_total);
   else if (ctx->settings.with_mp4_header)
+    ret = make_mp4_header(&header, src_ctx->ifmt_ctx->url);
+  else
+    ret = 0;
+
+  if (ret < 0)
     {
-      evbuffer_add(ctx->obuf, ctx->mp4_header, sizeof(ctx->mp4_header));
+      DPRINTF(E_LOG, L_XCODE, "Error creating wav/mp4 header\n");
+      goto out_free_streams;
+    }
+  else if (header)
+    {
+      evbuffer_add_buffer(ctx->obuf, header);
+      evbuffer_free(header);
     }
 
   return 0;
@@ -1764,13 +1784,8 @@ transcode_encode_setup(enum transcode_profile profile, struct media_quality *qua
     goto fail_free;
 
   dst_bytes_per_sample = av_get_bytes_per_sample(ctx->settings.sample_format);
-
   ctx->bytes_total = size_estimate(profile, ctx->settings.bit_rate, ctx->settings.sample_rate, dst_bytes_per_sample, ctx->settings.nb_channels, src_ctx->len_ms);
 
-  if (ctx->settings.with_wav_header)
-    make_wav_header(ctx->wav_header, ctx->settings.sample_rate, dst_bytes_per_sample, ctx->settings.nb_channels, ctx->bytes_total);
-  if (ctx->settings.with_mp4_header)
-    make_mp4_header(ctx->mp4_header, ctx->settings.sample_rate, dst_bytes_per_sample, ctx->settings.nb_channels, ctx->bytes_total);
   if (ctx->settings.with_icy && src_ctx->data_kind == DATA_KIND_HTTP)
     ctx->icy_interval = METADATA_ICY_INTERVAL * ctx->settings.nb_channels * dst_bytes_per_sample * ctx->settings.sample_rate;
 
