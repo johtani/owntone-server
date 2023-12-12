@@ -109,19 +109,19 @@ struct stream_ctx {
 
 static const struct content_type_map ext2ctype[] =
   {
-    { ".html", XCODE_NONE, "text/html; charset=utf-8" },
-    { ".xml",  XCODE_NONE, "text/xml; charset=utf-8" },
-    { ".css",  XCODE_NONE, "text/css; charset=utf-8" },
-    { ".txt",  XCODE_NONE, "text/plain; charset=utf-8" },
-    { ".js",   XCODE_NONE, "application/javascript; charset=utf-8" },
-    { ".gif",  XCODE_NONE, "image/gif" },
-    { ".ico",  XCODE_NONE, "image/x-ico" },
-    { ".png",  XCODE_PNG,  "image/png" },
-    { ".jpg",  XCODE_JPEG, "image/jpeg" },
-    { ".mp3",  XCODE_MP3,  "audio/mpeg" },
-    { ".m4a",  XCODE_MP4,  "audio/mp4" },
-    { ".wav",  XCODE_WAV,  "audio/wav" },
-    { NULL,    XCODE_NONE, NULL }
+    { ".html", XCODE_NONE,      "text/html; charset=utf-8" },
+    { ".xml",  XCODE_NONE,      "text/xml; charset=utf-8" },
+    { ".css",  XCODE_NONE,      "text/css; charset=utf-8" },
+    { ".txt",  XCODE_NONE,      "text/plain; charset=utf-8" },
+    { ".js",   XCODE_NONE,      "application/javascript; charset=utf-8" },
+    { ".gif",  XCODE_NONE,      "image/gif" },
+    { ".ico",  XCODE_NONE,      "image/x-ico" },
+    { ".png",  XCODE_PNG,       "image/png" },
+    { ".jpg",  XCODE_JPEG,      "image/jpeg" },
+    { ".mp3",  XCODE_MP3,       "audio/mpeg" },
+    { ".m4a",  XCODE_MP4_ALAC,  "audio/mp4" },
+    { ".wav",  XCODE_WAV,       "audio/wav" },
+    { NULL,    XCODE_NONE,      NULL }
   };
 
 static char webroot_directory[PATH_MAX];

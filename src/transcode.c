@@ -25,8 +25,6 @@
 #include <string.h>
 #include <unistd.h>
 
-#include <fcntl.h> // open() and O_RDONLY
-
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavfilter/avfilter.h>
@@ -75,6 +73,9 @@ static const char *itunes_codecs = "mpeg,mp4a,mp4v,alac,wav";
 // Used for passing errors to DPRINTF (can't count on av_err2str being present)
 static char errbuf[64];
 
+// Used by dummy_seek to mark a seek requested by ffmpeg
+static const uint8_t xcode_seek_marker[8] = { 0x0D, 0x0E, 0x0A, 0x0D, 0x0B, 0x0E, 0x0E, 0x0F };
+
 // The settings struct will be filled out based on the profile enum
 struct settings_ctx
 {
@@ -104,6 +105,8 @@ struct settings_ctx
   enum AVSampleFormat sample_format;
   bool with_mp4_header;
   bool with_wav_header;
+  bool without_libav_header;
+  bool without_libav_trailer;
   bool with_icy;
   bool with_user_filters;
 
@@ -183,6 +186,9 @@ struct encode_ctx
 
   // The ffmpeg muxer writes to this buffer using the avio_evbuffer interface
   struct evbuffer *obuf;
+
+  // IO Context for non-file output
+  struct transcode_evbuf_io evbuf_io;
 
   // Contains the most recent packet from av_buffersink_get_frame()
   AVFrame *filt_frame;
@@ -291,10 +297,18 @@ init_settings(struct settings_ctx *settings, enum transcode_profile profile, str
 	settings->frame_size = 352;
 	break;
 
-      case XCODE_MP4:
+      case XCODE_MP4_ALAC:
 	settings->with_mp4_header = true;
 	settings->encode_audio = true;
 	settings->format = "data";
+	settings->audio_codec = AV_CODEC_ID_ALAC;
+	break;
+
+      case XCODE_MP4_ALAC_HEADER:
+	settings->without_libav_header = true;
+	settings->without_libav_trailer = true;
+	settings->encode_audio = true;
+	settings->format = "mp4";
 	settings->audio_codec = AV_CODEC_ID_ALAC;
 	break;
 
@@ -414,7 +428,8 @@ init_settings_from_audio(struct settings_ctx *settings, enum transcode_profile p
   // Initialize settings that are both source-dependent and profile-dependent
   switch (profile)
     {
-      case XCODE_MP4:
+      case XCODE_MP4_ALAC:
+      case XCODE_MP4_ALAC_HEADER:
 	if (!settings->sample_format)
 	  settings->sample_format = (src_bytes_per_sample == 4) ? AV_SAMPLE_FMT_S32P : AV_SAMPLE_FMT_S16P;
 	break;
@@ -503,60 +518,31 @@ add_le32(uint8_t *dst, uint32_t val)
   dst[3] = (val >> 24) & 0xff;
 }
 
-/*
- * header must have size WAV_HEADER_LEN (44 bytes)
- */
-static int
-make_wav_header(struct evbuffer **header, int sample_rate, int bytes_per_sample, int channels, off_t bytes_total)
+static void
+evbuf_to_buf(uint8_t **buf, size_t *buflen, struct evbuffer *evbuf)
 {
-  uint8_t wav_header[WAV_HEADER_LEN];
+  *buflen = evbuffer_get_length(evbuf);
 
-  uint32_t wav_size = bytes_total - WAV_HEADER_LEN;
-
-  memcpy(wav_header, "RIFF", 4);
-  add_le32(wav_header + 4, 36 + wav_size);
-  memcpy(wav_header + 8, "WAVEfmt ", 8);
-  add_le32(wav_header + 16, 16);
-  add_le16(wav_header + 20, 1);
-  add_le16(wav_header + 22, channels);     /* channels */
-  add_le32(wav_header + 24, sample_rate);  /* samplerate */
-  add_le32(wav_header + 28, sample_rate * channels * bytes_per_sample); /* byte rate */
-  add_le16(wav_header + 32, channels * bytes_per_sample);               /* block align */
-  add_le16(wav_header + 34, 8 * bytes_per_sample);                      /* bits per sample */
-  memcpy(wav_header + 36, "data", 4);
-  add_le32(wav_header + 40, wav_size);
-
-  *header = evbuffer_new();
-  evbuffer_add(*header, wav_header, sizeof(wav_header));
-  return 0;
+  CHECK_NULL(L_XCODE, *buf = malloc(*buflen));
+  evbuffer_remove(evbuf, *buf, *buflen);
 }
 
-static int
-make_mp4_header(struct evbuffer **header, const char *url)
+// Doesn't actually seek, just inserts a marker in the obuf
+static int64_t
+dummy_seek(void *arg, int64_t offset, enum transcode_seek_type type)
 {
-  char path[PATH_MAX];
-  uint8_t buf[4096];
-  int fd = -1;
-  int len;
+  struct transcode_ctx *ctx = arg;
+  struct encode_ctx *enc_ctx = ctx->encode_ctx;
 
-  if (!url || *url != '/')
-    goto error;
+  if (type == XCODE_SEEK_SET)
+    {
+      evbuffer_add(enc_ctx->obuf, xcode_seek_marker, sizeof(xcode_seek_marker));
+      evbuffer_add(enc_ctx->obuf, &offset, sizeof(offset));
+      return offset;
+    }
+  else if (type == XCODE_SEEK_SIZE)
+    return enc_ctx->bytes_total;
 
-  snprintf(path, sizeof(path), "%s.mp4h", url);
-  fd = open(path, O_RDONLY);
-  if (fd < 0)
-    goto error;
-
-  *header = evbuffer_new();
-  while ((len = read(fd, buf, sizeof(buf))) > 0)
-    evbuffer_add(*header, buf, len);
-
-  close(fd);
-  return 0;
-
- error:
-  if (fd >= 0)
-    close(fd);
   return -1;
 }
 
@@ -577,7 +563,7 @@ size_estimate(enum transcode_profile profile, int bit_rate, int sample_rate, int
     bytes = (int64_t)len_ms * channels * bytes_per_sample * sample_rate / 1000 + WAV_HEADER_LEN;
   else if (profile == XCODE_MP3)
     bytes = (int64_t)len_ms * bit_rate / 8000;
-  else if (profile == XCODE_MP4)
+  else if (profile == XCODE_MP4_ALAC)
     bytes = (int64_t)len_ms * channels * bytes_per_sample * sample_rate / 1000 / 2; // FIXME
   else
     bytes = -1;
@@ -945,6 +931,7 @@ static int
 read_decode_filter_encode_write(struct transcode_ctx *ctx)
 {
   struct decode_ctx *dec_ctx = ctx->decode_ctx;
+  struct encode_ctx *enc_ctx = ctx->encode_ctx;
   enum AVMediaType type;
   int ret;
 
@@ -959,12 +946,10 @@ read_decode_filter_encode_write(struct transcode_ctx *ctx)
       if (dec_ctx->video_stream.stream)
 	decode_filter_encode_write(ctx, &dec_ctx->video_stream, NULL, AVMEDIA_TYPE_VIDEO);
 
-      // Flush muxer
-      if (ctx->encode_ctx)
-	{
-	  av_interleaved_write_frame(ctx->encode_ctx->ofmt_ctx, NULL);
-	  av_write_trailer(ctx->encode_ctx->ofmt_ctx);
-	}
+      if (enc_ctx)
+	av_interleaved_write_frame(enc_ctx->ofmt_ctx, NULL); // Flush muxer
+      if (enc_ctx && !enc_ctx->settings.without_libav_trailer)
+	av_write_trailer(enc_ctx->ofmt_ctx);
 
       return ret;
     }
@@ -1050,7 +1035,7 @@ avio_evbuffer_open(struct transcode_evbuf_io *evbuf_io, int is_output)
   ae->seekfn_arg = evbuf_io->seekfn_arg;
 
   if (is_output)
-    s = avio_alloc_context(ae->buffer, AVIO_BUFFER_SIZE, 1, ae, NULL, avio_evbuffer_write, NULL);
+    s = avio_alloc_context(ae->buffer, AVIO_BUFFER_SIZE, 1, ae, NULL, avio_evbuffer_write, (evbuf_io->seekfn ? avio_evbuffer_seek : NULL));
   else
     s = avio_alloc_context(ae->buffer, AVIO_BUFFER_SIZE, 0, ae, avio_evbuffer_read, NULL, (evbuf_io->seekfn ? avio_evbuffer_seek : NULL));
 
@@ -1066,22 +1051,6 @@ avio_evbuffer_open(struct transcode_evbuf_io *evbuf_io, int is_output)
   s->seekable = (evbuf_io->seekfn ? AVIO_SEEKABLE_NORMAL : 0);
 
   return s;
-}
-
-static AVIOContext *
-avio_input_evbuffer_open(struct transcode_evbuf_io *evbuf_io)
-{
-  return avio_evbuffer_open(evbuf_io, 0);
-}
-
-static AVIOContext *
-avio_output_evbuffer_open(struct evbuffer *evbuf)
-{
-  struct transcode_evbuf_io evbuf_io = { 0 };
-
-  evbuf_io.evbuf = evbuf;
-
-  return avio_evbuffer_open(&evbuf_io, 1);
 }
 
 static void
@@ -1100,6 +1069,203 @@ avio_evbuffer_close(AVIOContext *s)
   free(ae);
 
   av_free(s);
+}
+
+
+/* ----------------------- CUSTOM HEADER GENERATION ------------------------ */
+
+static int
+make_wav_header(struct evbuffer **header, int sample_rate, int bytes_per_sample, int channels, off_t bytes_total)
+{
+  uint8_t wav_header[WAV_HEADER_LEN];
+
+  uint32_t wav_size = bytes_total - WAV_HEADER_LEN;
+
+  memcpy(wav_header, "RIFF", 4);
+  add_le32(wav_header + 4, 36 + wav_size);
+  memcpy(wav_header + 8, "WAVEfmt ", 8);
+  add_le32(wav_header + 16, 16);
+  add_le16(wav_header + 20, 1);
+  add_le16(wav_header + 22, channels);     /* channels */
+  add_le32(wav_header + 24, sample_rate);  /* samplerate */
+  add_le32(wav_header + 28, sample_rate * channels * bytes_per_sample); /* byte rate */
+  add_le16(wav_header + 32, channels * bytes_per_sample);               /* block align */
+  add_le16(wav_header + 34, 8 * bytes_per_sample);                      /* bits per sample */
+  memcpy(wav_header + 36, "data", 4);
+  add_le32(wav_header + 40, wav_size);
+
+  *header = evbuffer_new();
+  evbuffer_add(*header, wav_header, sizeof(wav_header));
+  return 0;
+}
+
+static int
+adjust_moov_stco_offset(uint8_t *moov, size_t moov_len)
+{
+  uint8_t stco_needle[8] = { 's', 't', 'c', 'o', 0, 0, 0, 0 };
+  uint32_t be32;
+  uint32_t n_entries;
+  uint32_t entry;
+  uint8_t *ptr;
+  uint8_t *end;
+
+  end = moov + moov_len;
+  ptr = memmem(moov, moov_len, stco_needle, sizeof(stco_needle));
+  if (!ptr || ptr + sizeof(stco_needle) + sizeof(be32) > end)
+    return -1;
+
+  ptr += sizeof(stco_needle);
+  memcpy(&be32, ptr, sizeof(be32));
+  for (n_entries = be32toh(be32); n_entries > 0; n_entries--)
+    {
+      ptr += sizeof(be32);
+      if (ptr + sizeof(be32) > end)
+	return -1;
+
+      memcpy(&be32, ptr, sizeof(be32));
+      entry = be32toh(be32);
+      be32 = htobe32(entry + moov_len);
+      memcpy(ptr, &be32, sizeof(be32));
+    }
+
+  return 0;
+}
+
+// Transcodes the entire file so that we can grab the header, which will then
+// have a correct moov atom. The moov atom contains elements like stco and stsz
+// which can only be made when the encoding has been done, since they contain
+// information about where the frames are in the file. iTunes and Soundsbrdige
+// requires these to be correct, otherwise they won't play our transcoded files.
+// They also require that the atom is in the beginning of the file. ffmpeg's
+// "faststart" option does this, but is difficult to use with non-file output,
+// instead we move the atom ourselves.
+static int
+make_mp4_header(struct evbuffer **header, const char *url)
+{
+  struct transcode_ctx ctx = { 0 };
+  struct transcode_evbuf_io evbuf_io = { 0 };
+  uint8_t header_end[16] = { 0, 0, 0, 8, 'f', 'r', 'e', 'e', 0, 0, 0, 0, 'm', 'd', 'a', 't' };
+  uint8_t *mp4_header = NULL;
+  uint8_t *mp4_trailer = NULL;
+  size_t mp4_header_len;
+  size_t mp4_trailer_len;
+  size_t free_size_pos;
+  size_t mdat_size_pos;
+  size_t moov_size_pos;
+  int64_t mdat_offset;
+  int ret;
+
+  if (!url || *url != '/')
+    return -1;
+
+  CHECK_NULL(L_XCODE, evbuf_io.evbuf = evbuffer_new());
+
+  evbuf_io.seekfn = dummy_seek;
+  evbuf_io.seekfn_arg = &ctx;
+
+  ctx.decode_ctx = transcode_decode_setup(XCODE_MP4_ALAC_HEADER, NULL, DATA_KIND_FILE, url, NULL, -1);
+  if (!ctx.decode_ctx)
+    goto error;
+
+  ctx.encode_ctx = transcode_encode_setup_with_io(XCODE_MP4_ALAC_HEADER, NULL, &evbuf_io, ctx.decode_ctx, 0, 0);
+  if (!ctx.encode_ctx)
+    goto error;
+
+  // Save the template header, which looks something like this (note that the
+  // mdate size is still unknown, so just zeroes, and there is no moov):
+  //
+  //  0000  00 00 00 1c 66 74 79 70 69 73 6f 6d 00 00 02 00  ....ftypisom....
+  //  0010  69 73 6f 6d 69 73 6f 32 6d 70 34 31 00 00 00 08  isomiso2mp41....
+  //  0020  66 72 65 65 00 00 00 00 6d 64 61 74              free....mdat
+  ret = avformat_write_header(ctx.encode_ctx->ofmt_ctx, NULL);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_XCODE, "Error writing MP4 header to output buffer: %s\n", err2str(ret));
+      goto error;
+    }
+
+  evbuf_to_buf(&mp4_header, &mp4_header_len, ctx.encode_ctx->obuf);
+
+  free_size_pos = mp4_header_len - sizeof(header_end);
+  if (mp4_header_len < 32 || memcmp(mp4_header + free_size_pos, header_end, sizeof(header_end)) != 0)
+    {
+      DPRINTF(E_LOG, L_XCODE, "Unexpected MP4 template header received from libav, can't create MP4 header\n");
+      goto error;
+    }
+
+  // Encode but discard result, this is just so that ffmpeg can create the
+  // missing header data.
+  while (read_decode_filter_encode_write(&ctx) == 0)
+    evbuffer_drain(ctx.encode_ctx->obuf, -1);
+
+  // Here, ffmpeg will seek back and write the size to the mdat atom and then
+  // seek forward again to write the trailer. Since we can't actually seek, we
+  // instead look for the markers that dummy_seek() inserted.
+  av_write_trailer(ctx.encode_ctx->ofmt_ctx);
+  evbuf_to_buf(&mp4_trailer, &mp4_trailer_len, ctx.encode_ctx->obuf);
+
+  // Sanity check the trailer, it should look something like this:
+  //  0000  0d 0e 0a 0d 0b 0e 0e 0f 24 00 00 00 00 00 00 00  ........$.......
+  //  0010  00 13 f3 7a 0d 0e 0a 0d 0b 0e 0e 0f 9e f3 13 00  ...z............
+  //  0020  00 00 00 00 00 00 06 8e 6d 6f 6f 76 00 00 00 6c  ........moov...l
+  //  0030  6d 76 68 64 00 00 00 00 00 00 00 00 00 00 00 00  mvhd............
+  //  ....
+  mdat_size_pos = sizeof(xcode_seek_marker) + sizeof(int64_t);
+  moov_size_pos = mdat_size_pos + 4 + sizeof(xcode_seek_marker) + sizeof(int64_t);
+  if (mp4_trailer_len < 256 ||
+      memcmp(mp4_trailer, xcode_seek_marker, sizeof(xcode_seek_marker)) != 0 ||
+      memcmp(mp4_trailer + mdat_size_pos + 4, xcode_seek_marker, sizeof(xcode_seek_marker)) != 0 ||
+      memcmp(mp4_trailer + moov_size_pos + 4, "moov", strlen("moov")) != 0
+     )
+    {
+      DPRINTF(E_LOG, L_XCODE, "Unexpected MP4 trailer received from libav, can't create MP4 header\n");
+      goto error;
+    }
+
+  memcpy(&mdat_offset, mp4_trailer + mdat_size_pos - sizeof(int64_t), sizeof(int64_t));
+  if (mdat_offset != free_size_pos + 8)
+    {
+      DPRINTF(E_LOG, L_XCODE, "Unexpected MP4 trailer received from libav, can't create MP4 header\n");
+      goto error;
+    }
+
+  // Since we are going to insert the moov atom in the beginning of the file,
+  // the stream data (mdat) will have a later position
+  if (adjust_moov_stco_offset(mp4_trailer + moov_size_pos, mp4_trailer_len - moov_size_pos) < 0)
+    {
+      DPRINTF(E_LOG, L_XCODE, "Couldn't adjust MP4 stco tag\n");
+      goto error;
+    }
+
+  mp4_header_len += mp4_trailer_len - moov_size_pos;
+  CHECK_NULL(L_XCODE, mp4_header = realloc(mp4_header, mp4_header_len));
+
+  // Copy the moov atom into the header
+  memcpy(mp4_header + free_size_pos, mp4_trailer + moov_size_pos, mp4_trailer_len - moov_size_pos);
+  memcpy(mp4_header + mp4_header_len - sizeof(header_end), header_end, sizeof(header_end));
+
+  // Adjust the mdat size
+  memcpy(mp4_header + mp4_header_len - sizeof(header_end) + 8, mp4_trailer + mdat_size_pos, 4);
+
+//  DHEXDUMP(E_LOG, L_XCODE, mp4_header, mp4_header_len, "MP4 HEADER\n");
+
+  *header = evbuffer_new();
+  evbuffer_add(*header, mp4_header, mp4_header_len);
+
+  free(mp4_header);
+  free(mp4_trailer);
+  transcode_decode_cleanup(&ctx.decode_ctx);
+  transcode_encode_cleanup(&ctx.encode_ctx);
+  evbuffer_free(evbuf_io.evbuf);
+  return 0;
+
+ error:
+  free(mp4_header);
+  free(mp4_trailer);
+  transcode_decode_cleanup(&ctx.decode_ctx);
+  transcode_encode_cleanup(&ctx.encode_ctx);
+  evbuffer_free(evbuf_io.evbuf);
+  return -1;
 }
 
 
@@ -1148,6 +1314,19 @@ open_decoder(AVCodecContext **dec_ctx, unsigned int *stream_index, struct decode
     }
 
   return 0;
+}
+
+static void
+close_input(struct decode_ctx *ctx)
+{
+  if (!ctx->ifmt_ctx)
+    return;
+
+  avio_evbuffer_close(ctx->avio);
+  avcodec_free_context(&ctx->audio_stream.codec);
+  avcodec_free_context(&ctx->video_stream.codec);
+  avformat_close_input(&ctx->ifmt_ctx);
+  ctx->ifmt_ctx = NULL;
 }
 
 static int
@@ -1205,7 +1384,7 @@ open_input(struct decode_ctx *ctx, const char *path, struct transcode_evbuf_io *
 	  goto out_fail;
 	}
 
-      CHECK_NULL(L_XCODE, ctx->avio = avio_input_evbuffer_open(evbuf_io));
+      CHECK_NULL(L_XCODE, ctx->avio = avio_evbuffer_open(evbuf_io, 0));
 
       ctx->ifmt_ctx->pb = ctx->avio;
       ret = avformat_open_input(&ctx->ifmt_ctx, NULL, ifmt, &options);
@@ -1266,25 +1445,25 @@ open_input(struct decode_ctx *ctx, const char *path, struct transcode_evbuf_io *
   return 0;
 
  out_fail:
-  avio_evbuffer_close(ctx->avio);
-  avcodec_free_context(&ctx->audio_stream.codec);
-  avcodec_free_context(&ctx->video_stream.codec);
-  avformat_close_input(&ctx->ifmt_ctx);
-
+  close_input(ctx);
   return (ret < 0 ? ret : -1); // If we got an error code from ffmpeg then return that
 }
 
 static void
-close_input(struct decode_ctx *ctx)
+close_output(struct encode_ctx *ctx)
 {
-  avio_evbuffer_close(ctx->avio);
+  if (!ctx->ofmt_ctx)
+    return;
+
   avcodec_free_context(&ctx->audio_stream.codec);
   avcodec_free_context(&ctx->video_stream.codec);
-  avformat_close_input(&ctx->ifmt_ctx);
+  avio_evbuffer_close(ctx->ofmt_ctx->pb);
+  avformat_free_context(ctx->ofmt_ctx);
+  ctx->ofmt_ctx = NULL;
 }
 
 static int
-open_output(struct encode_ctx *ctx, struct decode_ctx *src_ctx)
+open_output(struct encode_ctx *ctx, struct transcode_evbuf_io *evbuf_io, struct decode_ctx *src_ctx)
 {
 #if USE_CONST_AVFORMAT
   const AVOutputFormat *oformat;
@@ -1315,101 +1494,76 @@ open_output(struct encode_ctx *ctx, struct decode_ctx *src_ctx)
   ctx->ofmt_ctx->oformat = oformat;
 #endif
 
-  ctx->obuf = evbuffer_new();
-  if (!ctx->obuf)
-    {
-      DPRINTF(E_LOG, L_XCODE, "Could not create output evbuffer\n");
-      goto out_free_output;
-    }
-
-  ctx->ofmt_ctx->pb = avio_output_evbuffer_open(ctx->obuf);
-  if (!ctx->ofmt_ctx->pb)
-    {
-      DPRINTF(E_LOG, L_XCODE, "Could not create output avio pb\n");
-      goto out_free_evbuf;
-    }
+  CHECK_NULL(L_XCODE, ctx->ofmt_ctx->pb = avio_evbuffer_open(evbuf_io, 1));
+  ctx->obuf = evbuf_io->evbuf;
 
   if (ctx->settings.encode_audio)
     {
       ret = stream_add(ctx, &ctx->audio_stream, ctx->settings.audio_codec);
       if (ret < 0)
-	goto out_free_streams;
+	goto error;
     }
 
   if (ctx->settings.encode_video)
     {
       ret = stream_add(ctx, &ctx->video_stream, ctx->settings.video_codec);
       if (ret < 0)
-	goto out_free_streams;
+	goto error;
     }
 
-  // By default ffmpeg can't mux mp4 to a stream, since it is non-seekable, and
-  // normally the muxing involves writing some header bytes when the encoding is
-  // completed. This is solution for that found on stackoverflow. "movflags" set
-  // to "empty_moov" was also suggested, but it doesn't seem required.
-  if (strcmp("mp4", oformat->name) == 0)
-    {
-      av_dict_set_int(&options, "frag_size", STREAM_CHUNK_SIZE, 0);
-//      av_dict_set(&options, "movflags", "empty_moov", 0);
-    }
-
-  // Notice, this will not write WAV header (so we do that manually)
-  ret = avformat_write_header(ctx->ofmt_ctx, &options);
+  ret = avformat_init_output(ctx->ofmt_ctx, &options);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_XCODE, "Error writing header to output buffer: %s\n", err2str(ret));
-      goto out_free_streams;
+      DPRINTF(E_LOG, L_XCODE, "Error initializing output: %s\n", err2str(ret));
+      goto error;
     }
-
-  if (options)
+  else if (options)
     {
-      DPRINTF(E_WARN, L_XCODE, "Didn't recognize all options given to avformat_write_header\n");
+      DPRINTF(E_WARN, L_XCODE, "Didn't recognize all options given to avformat_init_output\n");
       av_dict_free(&options);
+      goto error;
     }
 
+  // For WAV output, both avformat_write_header() and manual wav header is required
+  if (!ctx->settings.without_libav_header)
+    {
+      ret = avformat_write_header(ctx->ofmt_ctx, NULL);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_XCODE, "Error writing header to output buffer: %s\n", err2str(ret));
+	  goto error;
+	}
+    }
   if (ctx->settings.with_wav_header)
-    ret = make_wav_header(&header, ctx->settings.sample_rate, av_get_bytes_per_sample(ctx->settings.sample_format), ctx->settings.nb_channels, ctx->bytes_total);
-  else if (ctx->settings.with_mp4_header)
-    ret = make_mp4_header(&header, src_ctx->ifmt_ctx->url);
-  else
-    ret = 0;
+    {
+      ret = make_wav_header(&header, ctx->settings.sample_rate, av_get_bytes_per_sample(ctx->settings.sample_format), ctx->settings.nb_channels, ctx->bytes_total);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_XCODE, "Error creating WAV header\n");
+	  goto error;
+	}
 
-  if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_XCODE, "Error creating wav/mp4 header\n");
-      goto out_free_streams;
+      evbuffer_add_buffer(ctx->obuf, header);
+      evbuffer_free(header);
     }
-  else if (header)
+  if (ctx->settings.with_mp4_header)
     {
+      ret = make_mp4_header(&header, src_ctx->ifmt_ctx->url);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_XCODE, "Error creating MP4 header\n");
+	  goto error;
+	}
+
       evbuffer_add_buffer(ctx->obuf, header);
       evbuffer_free(header);
     }
 
   return 0;
 
- out_free_streams:
-  avcodec_free_context(&ctx->audio_stream.codec);
-  avcodec_free_context(&ctx->video_stream.codec);
-
-  avio_evbuffer_close(ctx->ofmt_ctx->pb);
- out_free_evbuf:
-  evbuffer_free(ctx->obuf);
- out_free_output:
-  avformat_free_context(ctx->ofmt_ctx);
-
+ error:
+  close_output(ctx);
   return -1;
-}
-
-static void
-close_output(struct encode_ctx *ctx)
-{
-  avcodec_free_context(&ctx->audio_stream.codec);
-  avcodec_free_context(&ctx->video_stream.codec);
-
-  avio_evbuffer_close(ctx->ofmt_ctx->pb);
-  evbuffer_free(ctx->obuf);
-
-  avformat_free_context(ctx->ofmt_ctx);
 }
 
 static int
@@ -1670,6 +1824,13 @@ create_filtergraph(struct stream_ctx *out_stream, struct filters *filters, size_
   return -1;
 }
 
+static void
+close_filters(struct encode_ctx *ctx)
+{
+  avfilter_graph_free(&ctx->audio_stream.filter_graph);
+  avfilter_graph_free(&ctx->video_stream.filter_graph);
+}
+
 static int
 open_filters(struct encode_ctx *ctx, struct decode_ctx *src_ctx)
 {
@@ -1706,16 +1867,8 @@ open_filters(struct encode_ctx *ctx, struct decode_ctx *src_ctx)
   return 0;
 
  out_fail:
-  avfilter_graph_free(&ctx->audio_stream.filter_graph);
-  avfilter_graph_free(&ctx->video_stream.filter_graph);
+  close_filters(ctx);
   return -1;
-}
-
-static void
-close_filters(struct encode_ctx *ctx)
-{
-  avfilter_graph_free(&ctx->audio_stream.filter_graph);
-  avfilter_graph_free(&ctx->video_stream.filter_graph);
 }
 
 
@@ -1764,7 +1917,7 @@ transcode_decode_setup(enum transcode_profile profile, struct media_quality *qua
 }
 
 struct encode_ctx *
-transcode_encode_setup(enum transcode_profile profile, struct media_quality *quality, struct decode_ctx *src_ctx, int width, int height)
+transcode_encode_setup_with_io(enum transcode_profile profile, struct media_quality *quality, struct transcode_evbuf_io *evbuf_io, struct decode_ctx *src_ctx, int width, int height)
 {
   struct encode_ctx *ctx;
   int dst_bytes_per_sample;
@@ -1772,16 +1925,21 @@ transcode_encode_setup(enum transcode_profile profile, struct media_quality *qua
   CHECK_NULL(L_XCODE, ctx = calloc(1, sizeof(struct encode_ctx)));
   CHECK_NULL(L_XCODE, ctx->filt_frame = av_frame_alloc());
   CHECK_NULL(L_XCODE, ctx->encoded_pkt = av_packet_alloc());
+  CHECK_NULL(L_XCODE, ctx->evbuf_io.evbuf = evbuffer_new());
+
+  // Caller didn't specify one, so use our own
+  if (!evbuf_io)
+    evbuf_io = &ctx->evbuf_io;
 
   // Initialize general settings
   if (init_settings(&ctx->settings, profile, quality) < 0)
-    goto fail_free;
+    goto error;
 
   if (ctx->settings.encode_audio && init_settings_from_audio(&ctx->settings, profile, src_ctx, quality) < 0)
-    goto fail_free;
+    goto error;
 
   if (ctx->settings.encode_video && init_settings_from_video(&ctx->settings, profile, src_ctx, width, height) < 0)
-    goto fail_free;
+    goto error;
 
   dst_bytes_per_sample = av_get_bytes_per_sample(ctx->settings.sample_format);
   ctx->bytes_total = size_estimate(profile, ctx->settings.bit_rate, ctx->settings.sample_rate, dst_bytes_per_sample, ctx->settings.nb_channels, src_ctx->len_ms);
@@ -1789,21 +1947,23 @@ transcode_encode_setup(enum transcode_profile profile, struct media_quality *qua
   if (ctx->settings.with_icy && src_ctx->data_kind == DATA_KIND_HTTP)
     ctx->icy_interval = METADATA_ICY_INTERVAL * ctx->settings.nb_channels * dst_bytes_per_sample * ctx->settings.sample_rate;
 
-  if (open_output(ctx, src_ctx) < 0)
-    goto fail_free;
+  if (open_output(ctx, evbuf_io, src_ctx) < 0)
+    goto error;
 
   if (open_filters(ctx, src_ctx) < 0)
-    goto fail_close;
+    goto error;
 
   return ctx;
 
- fail_close:
-  close_output(ctx);
- fail_free:
-  av_packet_free(&ctx->encoded_pkt);
-  av_frame_free(&ctx->filt_frame);
-  free(ctx);
+ error:
+  transcode_encode_cleanup(&ctx);
   return NULL;
+}
+
+struct encode_ctx *
+transcode_encode_setup(enum transcode_profile profile, struct media_quality *quality, struct decode_ctx *src_ctx, int width, int height)
+{
+  return transcode_encode_setup_with_io(profile, quality, NULL, src_ctx, width, height);
 }
 
 struct transcode_ctx *
@@ -1967,7 +2127,7 @@ transcode_needed(const char *user_agent, const char *client_codecs, char *file_c
   if (prefer_format)
     {
       if (strcmp(prefer_format, "alac") == 0 && supports_alac)
-	return XCODE_MP4;
+	return XCODE_MP4_ALAC;
       else if (strcmp(prefer_format, "wav") == 0 && supports_wav)
 	return XCODE_WAV;
       else if (strcmp(prefer_format, "mpeg") == 0 && supports_mpeg)
@@ -1975,7 +2135,7 @@ transcode_needed(const char *user_agent, const char *client_codecs, char *file_c
     }
 
   if (supports_alac)
-    return XCODE_MP4;
+    return XCODE_MP4_ALAC;
   else if (supports_wav)
     return XCODE_WAV;
   else if (supports_mpeg)
@@ -2010,6 +2170,7 @@ transcode_encode_cleanup(struct encode_ctx **ctx)
   close_filters(*ctx);
   close_output(*ctx);
 
+  evbuffer_free((*ctx)->evbuf_io.evbuf);
   av_packet_free(&(*ctx)->encoded_pkt);
   av_frame_free(&(*ctx)->filt_frame);
   free(*ctx);
@@ -2402,7 +2563,7 @@ transcode_metadata_strings_set(struct transcode_metadata_string *s, enum transco
 	snprintf(s->file_size, sizeof(s->file_size), "%d", (int)bytes);
 	break;
 
-      case XCODE_MP4:
+      case XCODE_MP4_ALAC:
 	s->type = "m4a";
 	s->codectype = "alac";
 	s->description = "Apple Lossless audio file";
