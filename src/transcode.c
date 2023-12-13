@@ -518,13 +518,28 @@ add_le32(uint8_t *dst, uint32_t val)
   dst[3] = (val >> 24) & 0xff;
 }
 
-static void
-evbuf_to_buf(uint8_t **buf, size_t *buflen, struct evbuffer *evbuf)
+// Copies the src buffer to position pos of the dst buffer, expanding dst if
+// needed to fit src. Can be called with *dst = NULL and *dst_len = 0. Returns
+// the number of bytes dst was expanded with.
+static int
+copy_buffer_to_position(uint8_t **dst, size_t *dst_len, uint8_t *src, size_t src_len, int64_t pos)
 {
-  *buflen = evbuffer_get_length(evbuf);
+  int bytes_added = 0;
 
-  CHECK_NULL(L_XCODE, *buf = malloc(*buflen));
-  evbuffer_remove(evbuf, *buf, *buflen);
+  if (pos < 0 || pos > *dst_len)
+    return -1; // Out of bounds
+  if (src_len == 0)
+    return 0; // Nothing to do
+
+  if (pos + src_len > *dst_len)
+    {
+      bytes_added = pos + src_len - *dst_len;
+      *dst_len += bytes_added;
+      CHECK_NULL(L_XCODE, *dst = realloc(*dst, *dst_len));
+    }
+
+  memcpy(*dst + pos, src, src_len);
+  return bytes_added;
 }
 
 // Doesn't actually seek, just inserts a marker in the obuf
@@ -1075,27 +1090,27 @@ avio_evbuffer_close(AVIOContext *s)
 /* ----------------------- CUSTOM HEADER GENERATION ------------------------ */
 
 static int
-make_wav_header(struct evbuffer **header, int sample_rate, int bytes_per_sample, int channels, off_t bytes_total)
+make_wav_header(struct evbuffer **wav_header, int sample_rate, int bytes_per_sample, int channels, off_t bytes_total)
 {
-  uint8_t wav_header[WAV_HEADER_LEN];
+  uint8_t header[WAV_HEADER_LEN];
 
   uint32_t wav_size = bytes_total - WAV_HEADER_LEN;
 
-  memcpy(wav_header, "RIFF", 4);
-  add_le32(wav_header + 4, 36 + wav_size);
-  memcpy(wav_header + 8, "WAVEfmt ", 8);
-  add_le32(wav_header + 16, 16);
-  add_le16(wav_header + 20, 1);
-  add_le16(wav_header + 22, channels);     /* channels */
-  add_le32(wav_header + 24, sample_rate);  /* samplerate */
-  add_le32(wav_header + 28, sample_rate * channels * bytes_per_sample); /* byte rate */
-  add_le16(wav_header + 32, channels * bytes_per_sample);               /* block align */
-  add_le16(wav_header + 34, 8 * bytes_per_sample);                      /* bits per sample */
-  memcpy(wav_header + 36, "data", 4);
-  add_le32(wav_header + 40, wav_size);
+  memcpy(header, "RIFF", 4);
+  add_le32(header + 4, 36 + wav_size);
+  memcpy(header + 8, "WAVEfmt ", 8);
+  add_le32(header + 16, 16);
+  add_le16(header + 20, 1);
+  add_le16(header + 22, channels);     /* channels */
+  add_le32(header + 24, sample_rate);  /* samplerate */
+  add_le32(header + 28, sample_rate * channels * bytes_per_sample); /* byte rate */
+  add_le16(header + 32, channels * bytes_per_sample);               /* block align */
+  add_le16(header + 34, 8 * bytes_per_sample);                      /* bits per sample */
+  memcpy(header + 36, "data", 4);
+  add_le32(header + 40, wav_size);
 
-  *header = evbuffer_new();
-  evbuffer_add(*header, wav_header, sizeof(wav_header));
+  *wav_header = evbuffer_new();
+  evbuffer_add(*wav_header, header, sizeof(header));
   return 0;
 }
 
@@ -1131,6 +1146,45 @@ adjust_moov_stco_offset(uint8_t *moov, size_t moov_len)
   return 0;
 }
 
+static int
+mp4_header_trailer_from_evbuf(uint8_t **header, size_t *header_len, uint8_t **trailer, size_t *trailer_len, struct evbuffer *evbuf, int64_t start_pos)
+{
+  uint8_t *buf = evbuffer_pullup(evbuf, -1);
+  size_t buf_len = evbuffer_get_length(evbuf);
+  int64_t pos = start_pos;
+  int bytes_added = 0;
+  uint8_t *marker;
+  size_t len;
+  int ret;
+
+  while (buf_len > 0)
+    {
+      marker = memmem(buf, buf_len, xcode_seek_marker, sizeof(xcode_seek_marker));
+      len = marker ? marker - buf : buf_len;
+
+      if (pos <= *header_len) // Either first write of header or seek to pos inside header
+	ret = copy_buffer_to_position(header, header_len, buf, len, pos);
+      else if (pos >= start_pos) // Either first write of trailer or seek to pos inside trailer
+	ret = copy_buffer_to_position(trailer, trailer_len, buf, len, pos - start_pos);
+      else // Unexpected seek to body (pos is before trailer but not in header)
+	ret = -1;
+
+      if (ret < 0)
+	return -1;
+
+      bytes_added += ret;
+      if (!marker)
+	break;
+
+      memcpy(&pos, marker + sizeof(xcode_seek_marker), sizeof(pos));
+      buf += len + sizeof(xcode_seek_marker) + sizeof(pos);
+      buf_len -= len + sizeof(xcode_seek_marker) + sizeof(pos);
+  }
+
+  evbuffer_drain(evbuf, -1);
+  return bytes_added;
+}
+
 // Transcodes the entire file so that we can grab the header, which will then
 // have a correct moov atom. The moov atom contains elements like stco and stsz
 // which can only be made when the encoding has been done, since they contain
@@ -1140,19 +1194,16 @@ adjust_moov_stco_offset(uint8_t *moov, size_t moov_len)
 // "faststart" option does this, but is difficult to use with non-file output,
 // instead we move the atom ourselves.
 static int
-make_mp4_header(struct evbuffer **header, const char *url)
+make_mp4_header(struct evbuffer **mp4_header, const char *url)
 {
   struct transcode_ctx ctx = { 0 };
   struct transcode_evbuf_io evbuf_io = { 0 };
-  uint8_t header_end[16] = { 0, 0, 0, 8, 'f', 'r', 'e', 'e', 0, 0, 0, 0, 'm', 'd', 'a', 't' };
-  uint8_t *mp4_header = NULL;
-  uint8_t *mp4_trailer = NULL;
-  size_t mp4_header_len;
-  size_t mp4_trailer_len;
-  size_t free_size_pos;
-  size_t mdat_size_pos;
-  size_t moov_size_pos;
-  int64_t mdat_offset;
+  uint8_t free_tag[4] = { 'f', 'r', 'e', 'e' };
+  uint8_t *header = NULL;
+  uint8_t *trailer = NULL;
+  size_t header_len = 0;
+  size_t trailer_len = 0;
+  uint8_t *ptr;
   int ret;
 
   if (!url || *url != '/')
@@ -1179,89 +1230,70 @@ make_mp4_header(struct evbuffer **header, const char *url)
   //  0020  66 72 65 65 00 00 00 00 6d 64 61 74              free....mdat
   ret = avformat_write_header(ctx.encode_ctx->ofmt_ctx, NULL);
   if (ret < 0)
-    {
-      DPRINTF(E_LOG, L_XCODE, "Error writing MP4 header to output buffer: %s\n", err2str(ret));
-      goto error;
-    }
+    goto error;
 
-  evbuf_to_buf(&mp4_header, &mp4_header_len, ctx.encode_ctx->obuf);
+  // Writes the obuf to the header buffer, bytes_processed is 0
+  ret = mp4_header_trailer_from_evbuf(&header, &header_len, &trailer, &trailer_len, ctx.encode_ctx->obuf, ctx.encode_ctx->bytes_processed);
+  if (ret < 0)
+    goto error;
 
-  free_size_pos = mp4_header_len - sizeof(header_end);
-  if (mp4_header_len < 32 || memcmp(mp4_header + free_size_pos, header_end, sizeof(header_end)) != 0)
-    {
-      DPRINTF(E_LOG, L_XCODE, "Unexpected MP4 template header received from libav, can't create MP4 header\n");
-      goto error;
-    }
+  ctx.encode_ctx->bytes_processed += ret;
 
   // Encode but discard result, this is just so that ffmpeg can create the
   // missing header data.
   while (read_decode_filter_encode_write(&ctx) == 0)
-    evbuffer_drain(ctx.encode_ctx->obuf, -1);
+    {
+      ctx.encode_ctx->bytes_processed += evbuffer_get_length(ctx.encode_ctx->obuf);
+      evbuffer_drain(ctx.encode_ctx->obuf, -1);
+    }
 
   // Here, ffmpeg will seek back and write the size to the mdat atom and then
   // seek forward again to write the trailer. Since we can't actually seek, we
   // instead look for the markers that dummy_seek() inserted.
   av_write_trailer(ctx.encode_ctx->ofmt_ctx);
-  evbuf_to_buf(&mp4_trailer, &mp4_trailer_len, ctx.encode_ctx->obuf);
+  ret = mp4_header_trailer_from_evbuf(&header, &header_len, &trailer, &trailer_len, ctx.encode_ctx->obuf, ctx.encode_ctx->bytes_processed);
+  if (ret < 0 || !header || !trailer)
+    goto error;
 
-  // Sanity check the trailer, it should look something like this:
-  //  0000  0d 0e 0a 0d 0b 0e 0e 0f 24 00 00 00 00 00 00 00  ........$.......
-  //  0010  00 13 f3 7a 0d 0e 0a 0d 0b 0e 0e 0f 9e f3 13 00  ...z............
-  //  0020  00 00 00 00 00 00 06 8e 6d 6f 6f 76 00 00 00 6c  ........moov...l
-  //  0030  6d 76 68 64 00 00 00 00 00 00 00 00 00 00 00 00  mvhd............
-  //  ....
-  mdat_size_pos = sizeof(xcode_seek_marker) + sizeof(int64_t);
-  moov_size_pos = mdat_size_pos + 4 + sizeof(xcode_seek_marker) + sizeof(int64_t);
-  if (mp4_trailer_len < 256 ||
-      memcmp(mp4_trailer, xcode_seek_marker, sizeof(xcode_seek_marker)) != 0 ||
-      memcmp(mp4_trailer + mdat_size_pos + 4, xcode_seek_marker, sizeof(xcode_seek_marker)) != 0 ||
-      memcmp(mp4_trailer + moov_size_pos + 4, "moov", strlen("moov")) != 0
-     )
-    {
-      DPRINTF(E_LOG, L_XCODE, "Unexpected MP4 trailer received from libav, can't create MP4 header\n");
-      goto error;
-    }
+  // The trailer buffer should now contain the moov atom. We need to adjust the
+  // chunk offset (stco) in it because we will move it to the beginning of the
+  // file.
+  ret = adjust_moov_stco_offset(trailer, trailer_len);
+  if (ret < 0)
+    goto error;
 
-  memcpy(&mdat_offset, mp4_trailer + mdat_size_pos - sizeof(int64_t), sizeof(int64_t));
-  if (mdat_offset != free_size_pos + 8)
-    {
-      DPRINTF(E_LOG, L_XCODE, "Unexpected MP4 trailer received from libav, can't create MP4 header\n");
-      goto error;
-    }
+  // Now we want to move the trailer (which has the moov atom) into the header.
+  // We insert it before the free atom, because that's what ffmpeg does when
+  // the "faststart" option is set.
+  CHECK_NULL(L_XCODE, header = realloc(header, header_len + trailer_len));
 
-  // Since we are going to insert the moov atom in the beginning of the file,
-  // the stream data (mdat) will have a later position
-  if (adjust_moov_stco_offset(mp4_trailer + moov_size_pos, mp4_trailer_len - moov_size_pos) < 0)
-    {
-      DPRINTF(E_LOG, L_XCODE, "Couldn't adjust MP4 stco tag\n");
-      goto error;
-    }
+  ptr = memmem(header, header_len, free_tag, sizeof(free_tag));
+  if (!ptr || ptr - header < sizeof(uint32_t))
+    goto error;
 
-  mp4_header_len += mp4_trailer_len - moov_size_pos;
-  CHECK_NULL(L_XCODE, mp4_header = realloc(mp4_header, mp4_header_len));
+  ptr -= sizeof(uint32_t);
+  memmove(ptr + trailer_len, ptr, header + header_len - ptr);
+  memcpy(ptr, trailer, trailer_len);
+  header_len += trailer_len;
 
-  // Copy the moov atom into the header
-  memcpy(mp4_header + free_size_pos, mp4_trailer + moov_size_pos, mp4_trailer_len - moov_size_pos);
-  memcpy(mp4_header + mp4_header_len - sizeof(header_end), header_end, sizeof(header_end));
+  *mp4_header = evbuffer_new();
+  evbuffer_add(*mp4_header, header, header_len);
 
-  // Adjust the mdat size
-  memcpy(mp4_header + mp4_header_len - sizeof(header_end) + 8, mp4_trailer + mdat_size_pos, 4);
-
-//  DHEXDUMP(E_LOG, L_XCODE, mp4_header, mp4_header_len, "MP4 HEADER\n");
-
-  *header = evbuffer_new();
-  evbuffer_add(*header, mp4_header, mp4_header_len);
-
-  free(mp4_header);
-  free(mp4_trailer);
+  free(header);
+  free(trailer);
   transcode_decode_cleanup(&ctx.decode_ctx);
   transcode_encode_cleanup(&ctx.encode_ctx);
   evbuffer_free(evbuf_io.evbuf);
   return 0;
 
  error:
-  free(mp4_header);
-  free(mp4_trailer);
+  if (header)
+    DHEXDUMP(E_DBG, L_XCODE, header, header_len, "MP4 header\n");
+  if (trailer)
+    DHEXDUMP(E_DBG, L_XCODE, trailer, trailer_len, "MP4 trailer\n");
+
+  free(header);
+  free(trailer);
   transcode_decode_cleanup(&ctx.decode_ctx);
   transcode_encode_cleanup(&ctx.encode_ctx);
   evbuffer_free(evbuf_io.evbuf);
