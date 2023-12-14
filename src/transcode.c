@@ -308,7 +308,7 @@ init_settings(struct settings_ctx *settings, enum transcode_profile profile, str
 	settings->without_libav_header = true;
 	settings->without_libav_trailer = true;
 	settings->encode_audio = true;
-	settings->format = "mp4";
+	settings->format = "ipod"; // ffmpeg default mp4 variant, doesn't have btrt in the header
 	settings->audio_codec = AV_CODEC_ID_ALAC;
 	break;
 
