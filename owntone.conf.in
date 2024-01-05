@@ -52,8 +52,8 @@ general {
 	# IP addresses.
 #	bind_address = "::"
 
-	# Location of cache database
-#	cache_path = "@localstatedir@/cache/@PACKAGE@/cache.db"
+	# Directory where the server keeps cached data
+#	cache_dir = "@localstatedir@/cache/@PACKAGE@"
 
 	# DAAP requests that take longer than this threshold (in msec) get their
 	# replies cached for next time. Set to 0 to disable caching.
