@@ -1965,6 +1965,8 @@ cache_artwork_read(struct evbuffer *evbuf, const char *path, int *format)
 int
 cache_init(void)
 {
+  struct sched_param param = { 0 };
+
   cache_daap_threshold = cfg_getint(cfg_getsec(cfg, "general"), "cache_daap_threshold");
   if (cache_daap_threshold == 0)
     {
@@ -1974,7 +1976,9 @@ cache_init(void)
 
   CHECK_NULL(L_CACHE, evbase_cache = event_base_new());
   CHECK_NULL(L_CACHE, cmdbase = commands_base_new(evbase_cache, NULL));
+
   CHECK_ERR(L_CACHE, pthread_create(&tid_cache, NULL, cache, NULL));
+  CHECK_ERR(L_CACHE, pthread_setschedparam(tid_cache, SCHED_BATCH, &param));
   thread_setname(tid_cache, "cache");
 
   DPRINTF(E_INFO, L_CACHE, "Cache thread init\n");
