@@ -192,6 +192,7 @@ static sqlite3 *cache_xcode_hdl;
 static struct event *cache_xcode_updateev;
 static struct event *cache_xcode_prepareev;
 static bool cache_xcode_is_enabled;
+static bool cache_xcode_prepare_is_running;
 static int cache_xcode_last_file;
 static struct cache_db_def cache_xcode_db_def[] = {
   DB_DEF_ADMIN,
@@ -900,6 +901,15 @@ xcode_header_get(void *arg, int *retval)
 #undef Q_TMPL
 }
 
+static void
+xcode_trigger(void)
+{
+  struct timeval delay_xcode = { 5, 0 };
+
+  if (cache_xcode_is_enabled)
+    event_add(cache_xcode_updateev, &delay_xcode);
+}
+
 static enum command_state
 xcode_toggle(void *arg, int *retval)
 {
@@ -907,8 +917,7 @@ xcode_toggle(void *arg, int *retval)
 
   cache_xcode_is_enabled = *enable;
 
-  if (cache_xcode_is_enabled)
-    event_active(cache_xcode_updateev, 0, 0);
+  xcode_trigger();
 
   *retval = 0;
   return COMMAND_END;
@@ -1181,6 +1190,7 @@ xcode_prepare_next_header(void *arg)
   if (ret < 0 || ret == cache_xcode_last_file)
     {
       DPRINTF(E_LOG, L_CACHE, "Header generation completed\n");
+      cache_xcode_prepare_is_running = false;
       return;
     }
 
@@ -1205,11 +1215,12 @@ cache_xcode_update_cb(int fd, short what, void *arg)
   if (xcode_sync_with_files(cache_xcode_hdl) < 0)
     return;
 
-  if (!cache_is_initialized)
+  if (!cache_is_initialized || cache_xcode_prepare_is_running)
     return;
 
   DPRINTF(E_LOG, L_CACHE, "Kicking off header generation\n");
 
+  cache_xcode_prepare_is_running = true;
   event_active(cache_xcode_prepareev, 0, 0);
 }
 
@@ -1220,14 +1231,12 @@ static enum command_state
 cache_database_update(void *arg, int *retval)
 {
   struct timeval delay_daap = { 10, 0 };
-  struct timeval delay_xcode = { 5, 0 };
 
   event_add(cache_daap_updateev, &delay_daap);
 
 // TODO unlink or rename cache.db
 
-  if (cache_xcode_is_enabled)
-    event_add(cache_xcode_updateev, &delay_xcode);
+  xcode_trigger();
 
   *retval = 0;
   return COMMAND_END;
