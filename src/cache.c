@@ -934,6 +934,7 @@ xcode_add_entry(sqlite3 *hdl, uint32_t id, uint32_t ts, const char *path)
   char *errmsg;
   int ret;
 
+// TODO lower log level
   DPRINTF(E_LOG, L_CACHE, "Adding xcode file id %d, path '%s'\n", id, path);
 
   query = sqlite3_mprintf(Q_TMPL, id, ts, path);
@@ -960,6 +961,7 @@ xcode_del_entry(sqlite3 *hdl, uint32_t id)
   char *errmsg;
   int ret;
 
+// TODO lower log level
   DPRINTF(E_LOG, L_CACHE, "Deleting xcode file id %d\n", id);
 
   sqlite3_snprintf(sizeof(query), query, Q_TMPL_FILES, (int)id);
@@ -1006,8 +1008,11 @@ xcode_sync_with_files(sqlite3 *hdl)
   size_t cachelist_len = 0;
   struct query_params qp = { .type = Q_ITEMS, .filter = "f.data_kind = 0", .order = "f.id" };
   struct db_media_file_info dbmfi;
+  struct db_media_file_info *rowA;
+  struct cachelist *rowB;
   uint32_t id;
   uint32_t ts;
+  int cmp;
   int i;
   int ret;
 
@@ -1033,42 +1038,47 @@ xcode_sync_with_files(sqlite3 *hdl)
   if (ret < 0)
     goto error;
 
-  // Loop while either list has remaining items
-  i = 0;
-  while (1)
+  // Loop while either list ("A" files list, "B" cache list) has remaining items
+  for(i = 0, cmp = 0;;)
     {
-      ret = db_query_fetch_file(&dbmfi, &qp);
-      if (ret != 0) // At end of files table (or error occured)
-	{
-	  for (; i < cachelist_len; i++)
-	    xcode_del_entry(hdl, cachelist[i].id);
+      if (cmp <= 0)
+        rowA = (db_query_fetch_file(&dbmfi, &qp) == 0) ? &dbmfi : NULL;;
+      if (cmp >= 0)
+        rowB = (i < cachelist_len) ? &cachelist[i++] : NULL;
+      if (!rowA && !rowB)
+        break; // Done with both lists
 
-	  break;
+#if 0
+      if (rowA)
+	DPRINTF(E_DBG, L_CACHE, "cmp %d, rowA->id %s\n", cmp, rowA->id);
+      if (rowB)
+	DPRINTF(E_DBG, L_CACHE, "cmp %d, rowB->id %u, i %d, cachelist_len %zu\n", cmp, rowB->id, i, cachelist_len);
+#endif
+
+      if (rowA)
+	{
+	  safe_atou32(rowA->id, &id);
+	  safe_atou32(rowA->time_modified, &ts);
 	}
 
-      safe_atou32(dbmfi.id, &id);
-      safe_atou32(dbmfi.time_modified, &ts);
-
-      if (i == cachelist_len || cachelist[i].id > id) // At end of cache table or new file
+      cmp = 0; // In both lists - unless:
+      if (!rowB || (rowA && rowB->id > id)) // A had an item not in B
 	{
-	  xcode_add_entry(hdl, id, ts, dbmfi.path);
+	  xcode_add_entry(hdl, id, ts, rowA->path);
+	  cmp = -1;
 	}
-      else if (cachelist[i].id < id) // Removed file
+      else if (!rowA || (rowB && rowB->id < id)) // B had an item not in A
 	{
-	  xcode_del_entry(hdl, cachelist[i].id);
-	  i++;
+	  xcode_del_entry(hdl, rowB->id);
+	  cmp = 1;
 	}
-      else if (cachelist[i].id == id && cachelist[i].ts < ts) // Modified file
+      else if (rowB->id == id && rowB->ts < ts) // Item in B is too old
 	{
-	  xcode_del_entry(hdl, cachelist[i].id);
-	  xcode_add_entry(hdl, id, ts, dbmfi.path);
-	  i++;
-	}
-      else // Found in both tables and timestamp in cache table is adequate
-	{
-	  i++;
+	  xcode_del_entry(hdl, rowB->id);
+	  xcode_add_entry(hdl, id, ts, rowA->path);
 	}
     }
+
   db_query_end(&qp);
 
   free(cachelist);
@@ -1090,9 +1100,9 @@ xcode_prepare_header(sqlite3 *hdl, const char *format, int id, const char *path)
   size_t datalen = 0;
   int ret;
 
+#if 1
   DPRINTF(E_DBG, L_CACHE, "Preparing %s header for '%s' (file id %d)\n", format, path, id);
 
-#if 1
   if (strcmp(format, "mp4") == 0)
     ret = transcode_prepare_header(&header, XCODE_MP4_ALAC, path);
   else
@@ -1104,7 +1114,7 @@ xcode_prepare_header(sqlite3 *hdl, const char *format, int id, const char *path)
       datalen = evbuffer_get_length(header);
       data = evbuffer_pullup(header, -1);
     }
-#elif
+#else
   data = (unsigned char*)"dummy";
   datalen = 6;
 #endif
