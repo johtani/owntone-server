@@ -46,9 +46,15 @@
 #include "listener.h"
 #include "commands.h"
 
+struct cache_db
+{
+  pthread_mutex_t lck; // we need to do our own thread safety since SQLITE_CONFIG_MULTITHREAD is set by db.c
+  sqlite3 *hdl; // which cache database
+};
+
 struct cache_arg
 {
-  sqlite3 *hdl; // which cache database
+  struct cache_db *db;
 
   char *query; // daap query
   char *ua;    // user agent
@@ -118,11 +124,11 @@ static bool cache_is_suspended;
 
 // DAAP cache
 #define CACHE_DAAP_VERSION 5
-static sqlite3 *cache_daap_hdl;
 static struct event *cache_daap_updateev;
 // The user may configure a threshold (in msec), and queries slower than
 // that will have their reply cached
 static int cache_daap_threshold;
+static struct cache_db cache_daap_db = { .lck = PTHREAD_MUTEX_INITIALIZER };
 static struct cache_db_def cache_daap_db_def[] = {
   DB_DEF_ADMIN,
   {
@@ -155,8 +161,8 @@ static struct cache_db_def cache_daap_db_def[] = {
 
 // Artwork cache
 #define CACHE_ARTWORK_VERSION 5
-static sqlite3 *cache_artwork_hdl;
 static struct cache_artwork_stash cache_stash;
+static struct cache_db cache_artwork_db = { .lck = PTHREAD_MUTEX_INITIALIZER };
 static struct cache_db_def cache_artwork_db_def[] = {
   DB_DEF_ADMIN,
   {
@@ -188,12 +194,12 @@ static struct cache_db_def cache_artwork_db_def[] = {
 
 // Transcoding cache
 #define CACHE_XCODE_VERSION 1
-static sqlite3 *cache_xcode_hdl;
 static struct event *cache_xcode_updateev;
 static struct event *cache_xcode_prepareev;
 static bool cache_xcode_is_enabled;
 static bool cache_xcode_prepare_is_running;
 static int cache_xcode_last_file;
+static struct cache_db cache_xcode_db = { .lck = PTHREAD_MUTEX_INITIALIZER };
 static struct cache_db_def cache_xcode_db_def[] = {
   DB_DEF_ADMIN,
   {
@@ -426,33 +432,33 @@ cache_pragma_set(sqlite3 *hdl)
 }
 
 static void
-cache_close_one(sqlite3 **hdl)
+cache_close_one(struct cache_db *db)
 {
   sqlite3_stmt *stmt;
 
-  if (!*hdl)
+  if (!db || !db->hdl)
     return;
 
   /* Tear down anything that's in flight */
-  while ((stmt = sqlite3_next_stmt(*hdl, 0)))
+  while ((stmt = sqlite3_next_stmt(db->hdl, 0)))
     sqlite3_finalize(stmt);
 
-  sqlite3_close(*hdl);
-  *hdl = NULL;
+  sqlite3_close(db->hdl);
+  db->hdl = NULL;
 }
 
 static void
 cache_close(void)
 {
-  cache_close_one(&cache_daap_hdl);
-  cache_close_one(&cache_artwork_hdl);
-  cache_close_one(&cache_xcode_hdl);
+  cache_close_one(&cache_daap_db);
+  cache_close_one(&cache_artwork_db);
+  cache_close_one(&cache_xcode_db);
 
   DPRINTF(E_DBG, L_CACHE, "Cache closed\n");
 }
 
 static int
-cache_open_one(sqlite3 **hdl, const char *path, const char *name, int want_version, struct cache_db_def *db_def, int db_def_size)
+cache_open_one(struct cache_db *db, const char *path, const char *name, int want_version, struct cache_db_def *db_def, int db_def_size)
 {
   sqlite3 *h;
   int have_version;
@@ -496,7 +502,7 @@ cache_open_one(sqlite3 **hdl, const char *path, const char *name, int want_versi
       DPRINTF(E_INFO, L_CACHE, "Cache '%s' database tables created\n", name);
     }
 
-  *hdl = h;
+  db->hdl = h;
   return 0;
 
  error:
@@ -525,19 +531,19 @@ cache_open(void)
   CHECK_NULL(L_DB, filename = cfg_getstr(cfg_getsec(cfg, "general"), "cache_xcode_filename"));
   CHECK_NULL(L_DB, xcode_db_path = safe_asprintf("%s%s", directory, filename));
 
-  ret = cache_open_one(&cache_daap_hdl, daap_db_path, "daap", CACHE_DAAP_VERSION, cache_daap_db_def, ARRAY_SIZE(cache_daap_db_def));
+  ret = cache_open_one(&cache_daap_db, daap_db_path, "daap", CACHE_DAAP_VERSION, cache_daap_db_def, ARRAY_SIZE(cache_daap_db_def));
   if (ret < 0)
     goto error;
 
-  ret = cache_open_one(&cache_artwork_hdl, artwork_db_path, "artwork", CACHE_ARTWORK_VERSION, cache_artwork_db_def, ARRAY_SIZE(cache_artwork_db_def));
+  ret = cache_open_one(&cache_artwork_db, artwork_db_path, "artwork", CACHE_ARTWORK_VERSION, cache_artwork_db_def, ARRAY_SIZE(cache_artwork_db_def));
   if (ret < 0)
     goto error;
 
-  ret = cache_open_one(&cache_xcode_hdl, xcode_db_path, "xcode", CACHE_XCODE_VERSION, cache_xcode_db_def, ARRAY_SIZE(cache_xcode_db_def));
+  ret = cache_open_one(&cache_xcode_db, xcode_db_path, "xcode", CACHE_XCODE_VERSION, cache_xcode_db_def, ARRAY_SIZE(cache_xcode_db_def));
   if (ret < 0)
     goto error;
 
-  ret = cache_pragma_set(cache_artwork_hdl);
+  ret = cache_pragma_set(cache_artwork_db.hdl);
   if (ret < 0)
     goto error;
 
@@ -559,7 +565,7 @@ cache_open(void)
 
 /* Adds the reply (stored in evbuf) to the cache */
 static int
-cache_daap_reply_add(sqlite3 *hdl, const char *query, struct evbuffer *evbuf)
+cache_daap_reply_add(struct cache_db *db, const char *query, struct evbuffer *evbuf)
 {
 #define Q_TMPL "INSERT INTO replies (query, reply) VALUES (?, ?);"
   sqlite3_stmt *stmt;
@@ -570,10 +576,10 @@ cache_daap_reply_add(sqlite3 *hdl, const char *query, struct evbuffer *evbuf)
   datalen = evbuffer_get_length(evbuf);
   data = evbuffer_pullup(evbuf, -1);
 
-  ret = sqlite3_prepare_v2(hdl, Q_TMPL, -1, &stmt, 0);
+  ret = sqlite3_prepare_v2(db->hdl, Q_TMPL, -1, &stmt, 0);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_CACHE, "Error preparing query for cache update: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_CACHE, "Error preparing query for cache update: %s\n", sqlite3_errmsg(db->hdl));
       return -1;
     }
 
@@ -583,7 +589,7 @@ cache_daap_reply_add(sqlite3 *hdl, const char *query, struct evbuffer *evbuf)
   ret = sqlite3_step(stmt);
   if (ret != SQLITE_DONE)
     {
-      DPRINTF(E_LOG, L_CACHE, "Error stepping query for cache update: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_CACHE, "Error stepping query for cache update: %s\n", sqlite3_errmsg(db->hdl));
       sqlite3_finalize(stmt);
       return -1;
     }
@@ -591,7 +597,7 @@ cache_daap_reply_add(sqlite3 *hdl, const char *query, struct evbuffer *evbuf)
   ret = sqlite3_finalize(stmt);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_CACHE, "Error finalizing query for cache update: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_CACHE, "Error finalizing query for cache update: %s\n", sqlite3_errmsg(db->hdl));
       return -1;
     }
 
@@ -608,6 +614,7 @@ cache_daap_query_add(void *arg, int *retval)
 #define Q_TMPL "INSERT OR REPLACE INTO queries (user_agent, is_remote, query, msec, timestamp) VALUES ('%q', %d, '%q', %d, %" PRIi64 ");"
 #define Q_CLEANUP "DELETE FROM queries WHERE id NOT IN (SELECT id FROM queries ORDER BY timestamp DESC LIMIT 20);"
   struct cache_arg *cmdarg = arg;
+  struct cache_db *db = cmdarg->db;
   struct timeval delay = { 60, 0 };
   char *query;
   char *errmsg;
@@ -638,7 +645,7 @@ cache_daap_query_add(void *arg, int *retval)
       goto error_add;
     }
 
-  ret = sqlite3_exec(cmdarg->hdl, query, NULL, NULL, &errmsg);
+  ret = sqlite3_exec(db->hdl, query, NULL, NULL, &errmsg);
   sqlite3_free(query);
   if (ret != SQLITE_OK)
     {
@@ -654,7 +661,7 @@ cache_daap_query_add(void *arg, int *retval)
   free(cmdarg->query);
 
   // Limits the size of the cache to only contain replies for 20 most recent queries
-  ret = sqlite3_exec(cmdarg->hdl, Q_CLEANUP, NULL, NULL, &errmsg);
+  ret = sqlite3_exec(db->hdl, Q_CLEANUP, NULL, NULL, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_CACHE, "Error cleaning up query list before update: %s\n", errmsg);
@@ -690,6 +697,7 @@ cache_daap_query_get(void *arg, int *retval)
 {
 #define Q_TMPL "SELECT reply FROM replies WHERE query = ?;"
   struct cache_arg *cmdarg = arg;
+  struct cache_db *db = cmdarg->db;
   sqlite3_stmt *stmt;
   char *query;
   int datalen;
@@ -700,10 +708,10 @@ cache_daap_query_get(void *arg, int *retval)
   remove_tag(query, "revision-number");
 
   // Look in the DB
-  ret = sqlite3_prepare_v2(cmdarg->hdl, Q_TMPL, -1, &stmt, 0);
+  ret = sqlite3_prepare_v2(db->hdl, Q_TMPL, -1, &stmt, 0);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_CACHE, "Error preparing query for cache update: %s\n", sqlite3_errmsg(cmdarg->hdl));
+      DPRINTF(E_LOG, L_CACHE, "Error preparing query for cache update: %s\n", sqlite3_errmsg(db->hdl));
       free(query);
       *retval = -1;
       return COMMAND_END;
@@ -715,7 +723,7 @@ cache_daap_query_get(void *arg, int *retval)
   if (ret != SQLITE_ROW)  
     {
       if (ret != SQLITE_DONE)
-	DPRINTF(E_LOG, L_CACHE, "Error stepping query for cache update: %s\n", sqlite3_errmsg(cmdarg->hdl));
+	DPRINTF(E_LOG, L_CACHE, "Error stepping query for cache update: %s\n", sqlite3_errmsg(db->hdl));
       goto error_get;
     }
 
@@ -736,7 +744,7 @@ cache_daap_query_get(void *arg, int *retval)
 
   ret = sqlite3_finalize(stmt);
   if (ret != SQLITE_OK)
-    DPRINTF(E_LOG, L_CACHE, "Error finalizing query for getting cache: %s\n", sqlite3_errmsg(cmdarg->hdl));
+    DPRINTF(E_LOG, L_CACHE, "Error finalizing query for getting cache: %s\n", sqlite3_errmsg(db->hdl));
 
   DPRINTF(E_INFO, L_CACHE, "Cache hit: %s\n", query);
 
@@ -755,7 +763,7 @@ cache_daap_query_get(void *arg, int *retval)
 
 /* Removes the query from the cache */
 static int
-cache_daap_query_delete(sqlite3 *hdl, const int id)
+cache_daap_query_delete(struct cache_db *db, const int id)
 {
 #define Q_TMPL "DELETE FROM queries WHERE id = %d;"
   char *query;
@@ -764,7 +772,7 @@ cache_daap_query_delete(sqlite3 *hdl, const int id)
 
   query = sqlite3_mprintf(Q_TMPL, id);
 
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = sqlite3_exec(db->hdl, query, NULL, NULL, &errmsg);
   sqlite3_free(query);
   if (ret != SQLITE_OK)
     {
@@ -784,7 +792,7 @@ cache_daap_query_delete(sqlite3 *hdl, const int id)
 static void
 cache_daap_update_cb(int fd, short what, void *arg)
 {
-  sqlite3 *hdl = cache_daap_hdl;
+  struct cache_db *db = &cache_daap_db;
   sqlite3_stmt *stmt;
   struct evbuffer *evbuf;
   struct evbuffer *gzbuf;
@@ -800,7 +808,7 @@ cache_daap_update_cb(int fd, short what, void *arg)
 
   DPRINTF(E_INFO, L_CACHE, "Beginning DAAP cache update\n");
 
-  ret = sqlite3_exec(hdl, "DELETE FROM replies;", NULL, NULL, &errmsg);
+  ret = sqlite3_exec(db->hdl, "DELETE FROM replies;", NULL, NULL, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_CACHE, "Error clearing reply cache before update: %s\n", errmsg);
@@ -808,10 +816,10 @@ cache_daap_update_cb(int fd, short what, void *arg)
       return;
     }
 
-  ret = sqlite3_prepare_v2(hdl, "SELECT id, user_agent, is_remote, query FROM queries;", -1, &stmt, 0);
+  ret = sqlite3_prepare_v2(db->hdl, "SELECT id, user_agent, is_remote, query FROM queries;", -1, &stmt, 0);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_CACHE, "Error preparing for cache update: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_CACHE, "Error preparing for cache update: %s\n", sqlite3_errmsg(db->hdl));
       return;
     }
 
@@ -823,7 +831,7 @@ cache_daap_update_cb(int fd, short what, void *arg)
       if (!evbuf)
 	{
 	  DPRINTF(E_LOG, L_CACHE, "Error building DAAP reply for query: %s\n", query);
-	  cache_daap_query_delete(hdl, sqlite3_column_int(stmt, 0));
+	  cache_daap_query_delete(db, sqlite3_column_int(stmt, 0));
 	  free(query);
 
 	  continue;
@@ -833,7 +841,7 @@ cache_daap_update_cb(int fd, short what, void *arg)
       if (!gzbuf)
 	{
 	  DPRINTF(E_LOG, L_CACHE, "Error gzipping DAAP reply for query: %s\n", query);
-	  cache_daap_query_delete(hdl, sqlite3_column_int(stmt, 0));
+	  cache_daap_query_delete(db, sqlite3_column_int(stmt, 0));
 	  free(query);
 	  evbuffer_free(evbuf);
 
@@ -842,14 +850,14 @@ cache_daap_update_cb(int fd, short what, void *arg)
 
       evbuffer_free(evbuf);
 
-      cache_daap_reply_add(hdl, query, gzbuf);
+      cache_daap_reply_add(db, query, gzbuf);
 
       free(query);
       evbuffer_free(gzbuf);
     }
 
   if (ret != SQLITE_DONE)
-    DPRINTF(E_LOG, L_CACHE, "Could not step: %s\n", sqlite3_errmsg(hdl));
+    DPRINTF(E_LOG, L_CACHE, "Could not step: %s\n", sqlite3_errmsg(db->hdl));
 
   sqlite3_finalize(stmt);
 
@@ -861,12 +869,13 @@ xcode_header_get(void *arg, int *retval)
 {
 #define Q_TMPL "SELECT header FROM data WHERE length(header) > 0 AND file_id = ? AND format = ?;"
   struct cache_arg *cmdarg = arg;
+  struct cache_db *db = cmdarg->db;
   sqlite3_stmt *stmt = NULL;
   int ret;
 
   cmdarg->cached = 0;
 
-  ret = sqlite3_prepare_v2(cmdarg->hdl, Q_TMPL, -1, &stmt, 0);
+  ret = sqlite3_prepare_v2(db->hdl, Q_TMPL, -1, &stmt, 0);
   if (ret != SQLITE_OK)
     goto error;
 
@@ -893,7 +902,7 @@ xcode_header_get(void *arg, int *retval)
   return COMMAND_END;
 
  error:
-  DPRINTF(E_LOG, L_CACHE, "Database error getting prepared header from cache: %s\n", sqlite3_errmsg(cmdarg->hdl));
+  DPRINTF(E_LOG, L_CACHE, "Database error getting prepared header from cache: %s\n", sqlite3_errmsg(db->hdl));
   if (stmt)
     sqlite3_finalize(stmt);
   *retval = -1;
@@ -927,7 +936,7 @@ xcode_toggle(void *arg, int *retval)
 }
 
 static int
-xcode_add_entry(sqlite3 *hdl, uint32_t id, uint32_t ts, const char *path)
+xcode_add_entry(struct cache_db *db, uint32_t id, uint32_t ts, const char *path)
 {
 #define Q_TMPL "INSERT OR REPLACE INTO files (id, time_modified, filepath) VALUES (%d, %d, '%q');"
   char *query;
@@ -939,7 +948,7 @@ xcode_add_entry(sqlite3 *hdl, uint32_t id, uint32_t ts, const char *path)
 
   query = sqlite3_mprintf(Q_TMPL, id, ts, path);
 
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = sqlite3_exec(db->hdl, query, NULL, NULL, &errmsg);
   sqlite3_free(query);
   if (ret != SQLITE_OK)
     {
@@ -953,7 +962,7 @@ xcode_add_entry(sqlite3 *hdl, uint32_t id, uint32_t ts, const char *path)
 }
 
 static int
-xcode_del_entry(sqlite3 *hdl, uint32_t id)
+xcode_del_entry(struct cache_db *db, uint32_t id)
 {
 #define Q_TMPL_FILES "DELETE FROM files WHERE id = %d;"
 #define Q_TMPL_DATA "DELETE FROM data WHERE file_id = %d;"
@@ -965,7 +974,7 @@ xcode_del_entry(sqlite3 *hdl, uint32_t id)
   DPRINTF(E_LOG, L_CACHE, "Deleting xcode file id %d\n", id);
 
   sqlite3_snprintf(sizeof(query), query, Q_TMPL_FILES, (int)id);
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = sqlite3_exec(db->hdl, query, NULL, NULL, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_CACHE, "Error deleting row from xcode files: %s\n", errmsg);
@@ -974,7 +983,7 @@ xcode_del_entry(sqlite3 *hdl, uint32_t id)
     }
 
   sqlite3_snprintf(sizeof(query), query, Q_TMPL_DATA, (int)id);
-  ret = sqlite3_exec(hdl, query, NULL, NULL, &errmsg);
+  ret = sqlite3_exec(db->hdl, query, NULL, NULL, &errmsg);
   if (ret != SQLITE_OK)
     {
       DPRINTF(E_LOG, L_CACHE, "Error deleting rows from xcode_data: %s\n", errmsg);
@@ -1000,7 +1009,7 @@ xcode_del_entry(sqlite3 *hdl, uint32_t id)
  * rows until: table end OR id is larger OR id is equal and time equal or newer
  */
 static int
-xcode_sync_with_files(sqlite3 *hdl)
+xcode_sync_with_files(struct cache_db *db)
 {
   sqlite3_stmt *stmt;
   struct cachelist *cachelist = NULL;
@@ -1017,7 +1026,7 @@ xcode_sync_with_files(sqlite3 *hdl)
   int ret;
 
   // Both lists must be sorted by id, otherwise the compare below won't work
-  ret = sqlite3_prepare_v2(hdl, "SELECT id, time_modified FROM files ORDER BY id;", -1, &stmt, 0);
+  ret = sqlite3_prepare_v2(db->hdl, "SELECT id, time_modified FROM files ORDER BY id;", -1, &stmt, 0);
   if (ret != SQLITE_OK)
     goto error;
 
@@ -1064,18 +1073,18 @@ xcode_sync_with_files(sqlite3 *hdl)
       cmp = 0; // In both lists - unless:
       if (!rowB || (rowA && rowB->id > id)) // A had an item not in B
 	{
-	  xcode_add_entry(hdl, id, ts, rowA->path);
+	  xcode_add_entry(db, id, ts, rowA->path);
 	  cmp = -1;
 	}
       else if (!rowA || (rowB && rowB->id < id)) // B had an item not in A
 	{
-	  xcode_del_entry(hdl, rowB->id);
+	  xcode_del_entry(db, rowB->id);
 	  cmp = 1;
 	}
       else if (rowB->id == id && rowB->ts < ts) // Item in B is too old
 	{
-	  xcode_del_entry(hdl, rowB->id);
-	  xcode_add_entry(hdl, id, ts, rowA->path);
+	  xcode_del_entry(db, rowB->id);
+	  xcode_add_entry(db, id, ts, rowA->path);
 	}
     }
 
@@ -1091,7 +1100,7 @@ xcode_sync_with_files(sqlite3 *hdl)
 }
 
 static int
-xcode_prepare_header(sqlite3 *hdl, const char *format, int id, const char *path)
+xcode_prepare_header(struct cache_db *db, const char *format, int id, const char *path)
 {
 #define Q_TMPL "INSERT INTO data (timestamp, file_id, format, header) VALUES (?, ?, ?, ?);"
   struct evbuffer *header = NULL;
@@ -1119,10 +1128,10 @@ xcode_prepare_header(sqlite3 *hdl, const char *format, int id, const char *path)
   datalen = 6;
 #endif
 
-  ret = sqlite3_prepare_v2(hdl, Q_TMPL, -1, &stmt, 0);
+  ret = sqlite3_prepare_v2(db->hdl, Q_TMPL, -1, &stmt, 0);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_CACHE, "Error preparing xcode_data for cache update: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_CACHE, "Error preparing xcode_data for cache update: %s\n", sqlite3_errmsg(db->hdl));
       goto error;
     }
 
@@ -1134,7 +1143,7 @@ xcode_prepare_header(sqlite3 *hdl, const char *format, int id, const char *path)
   ret = sqlite3_step(stmt);
   if (ret != SQLITE_DONE)
     {
-      DPRINTF(E_LOG, L_CACHE, "Error stepping xcode_data for cache update: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_CACHE, "Error stepping xcode_data for cache update: %s\n", sqlite3_errmsg(db->hdl));
       goto error;
     }
 
@@ -1153,18 +1162,18 @@ xcode_prepare_header(sqlite3 *hdl, const char *format, int id, const char *path)
 }
 
 static int
-xcode_prepare_next_header_impl(sqlite3 *hdl, const char *format)
+xcode_prepare_next_header_impl(struct cache_db *db, const char *format)
 {
 #define Q_TMPL "SELECT f.id, f.filepath, d.id FROM files f LEFT JOIN data d ON f.id = d.file_id AND d.format = '%q' WHERE d.id IS NULL LIMIT 1;"
   sqlite3_stmt *stmt;
   char *query;
-  const char *file_path;
+  char *file_path;
   int file_id;
   int ret;
 
   query = sqlite3_mprintf(Q_TMPL, format);
 
-  ret = sqlite3_prepare_v2(hdl, query, -1, &stmt, 0);
+  ret = sqlite3_prepare_v2(db->hdl, query, -1, &stmt, 0);
   if (ret != SQLITE_OK)
     goto error;
 
@@ -1177,12 +1186,15 @@ xcode_prepare_next_header_impl(sqlite3 *hdl, const char *format)
     }
 
   file_id = sqlite3_column_int(stmt, 0);
-  file_path = (const char *)sqlite3_column_text(stmt, 1);
-
-  xcode_prepare_header(hdl, format, file_id, file_path);
+  file_path = strdup((char *)sqlite3_column_text(stmt, 1));
 
   sqlite3_finalize(stmt);
   sqlite3_free(query);
+
+  xcode_prepare_header(db, format, file_id, file_path);
+
+  free(file_path);
+
   return file_id;
 
  error:
@@ -1199,7 +1211,7 @@ xcode_prepare_next_header(void *arg)
 
   // Preparing headers can take very long, so we take one at a time, letting the
   // event loop run in between
-  ret = xcode_prepare_next_header_impl(cache_xcode_hdl, "mp4");
+  ret = xcode_prepare_next_header_impl(&cache_xcode_db, "mp4");
   if (ret < 0 || ret == cache_xcode_last_file)
     {
       DPRINTF(E_LOG, L_CACHE, "Header generation completed\n");
@@ -1225,7 +1237,7 @@ cache_xcode_prepare_cb(int fd, short what, void *arg)
 static void
 cache_xcode_update_cb(int fd, short what, void *arg)
 {
-  if (xcode_sync_with_files(cache_xcode_hdl) < 0)
+  if (xcode_sync_with_files(&cache_xcode_db) < 0)
     return;
 
   if (!cache_is_initialized || cache_xcode_prepare_is_running)
@@ -1278,6 +1290,7 @@ cache_artwork_ping_impl(void *arg, int *retval)
 #define Q_TMPL_PING "UPDATE artwork SET db_timestamp = %" PRIi64 " WHERE filepath = '%q' AND db_timestamp >= %" PRIi64 ";"
 #define Q_TMPL_DEL "DELETE FROM artwork WHERE filepath = '%q' AND db_timestamp < %" PRIi64 ";"
   struct cache_arg *cmdarg = arg;
+  struct cache_db *db = cmdarg->db;
   char *query;
   char *errmsg;
   int ret;
@@ -1286,7 +1299,7 @@ cache_artwork_ping_impl(void *arg, int *retval)
 
   DPRINTF(E_DBG, L_CACHE, "Running query '%s'\n", query);
 
-  ret = sqlite3_exec(cmdarg->hdl, query, NULL, NULL, &errmsg);
+  ret = sqlite3_exec(db->hdl, query, NULL, NULL, &errmsg);
   sqlite3_free(query);
   if (ret != SQLITE_OK)
     {
@@ -1301,7 +1314,7 @@ cache_artwork_ping_impl(void *arg, int *retval)
 
       DPRINTF(E_DBG, L_CACHE, "Running query '%s'\n", query);
 
-      ret = sqlite3_exec(cmdarg->hdl, query, NULL, NULL, &errmsg);
+      ret = sqlite3_exec(db->hdl, query, NULL, NULL, &errmsg);
       sqlite3_free(query);
       if (ret != SQLITE_OK)
 	{
@@ -1338,6 +1351,7 @@ cache_artwork_delete_by_path_impl(void *arg, int *retval)
 {
 #define Q_TMPL_DEL "DELETE FROM artwork WHERE filepath = '%q';"
   struct cache_arg *cmdarg = arg;
+  struct cache_db *db = cmdarg->db;
   char *query;
   char *errmsg;
   int ret;
@@ -1346,7 +1360,7 @@ cache_artwork_delete_by_path_impl(void *arg, int *retval)
 
   DPRINTF(E_DBG, L_CACHE, "Running query '%s'\n", query);
 
-  ret = sqlite3_exec(cmdarg->hdl, query, NULL, NULL, &errmsg);
+  ret = sqlite3_exec(db->hdl, query, NULL, NULL, &errmsg);
   sqlite3_free(query);
   if (ret != SQLITE_OK)
     {
@@ -1357,7 +1371,7 @@ cache_artwork_delete_by_path_impl(void *arg, int *retval)
       return COMMAND_END;
     }
 
-  DPRINTF(E_DBG, L_CACHE, "Deleted %d rows\n", sqlite3_changes(cmdarg->hdl));
+  DPRINTF(E_DBG, L_CACHE, "Deleted %d rows\n", sqlite3_changes(db->hdl));
 
   *retval = 0;
   return COMMAND_END;
@@ -1375,8 +1389,8 @@ static enum command_state
 cache_artwork_purge_cruft_impl(void *arg, int *retval)
 {
 #define Q_TMPL "DELETE FROM artwork WHERE db_timestamp < %" PRIi64 ";"
-
   struct cache_arg *cmdarg = arg;
+  struct cache_db *db = cmdarg->db;
   char *query;
   char *errmsg;
   int ret;
@@ -1385,7 +1399,7 @@ cache_artwork_purge_cruft_impl(void *arg, int *retval)
 
   DPRINTF(E_DBG, L_CACHE, "Running purge query '%s'\n", query);
 
-  ret = sqlite3_exec(cmdarg->hdl, query, NULL, NULL, &errmsg);
+  ret = sqlite3_exec(db->hdl, query, NULL, NULL, &errmsg);
   sqlite3_free(query);
   if (ret != SQLITE_OK)
     {
@@ -1396,7 +1410,7 @@ cache_artwork_purge_cruft_impl(void *arg, int *retval)
       return COMMAND_END;
     }
 
-  DPRINTF(E_DBG, L_CACHE, "Purged %d rows\n", sqlite3_changes(cmdarg->hdl));
+  DPRINTF(E_DBG, L_CACHE, "Purged %d rows\n", sqlite3_changes(db->hdl));
 
   *retval = 0;
   return COMMAND_END;
@@ -1419,6 +1433,7 @@ static enum command_state
 cache_artwork_add_impl(void *arg, int *retval)
 {
   struct cache_arg *cmdarg = arg;
+  struct cache_db *db = cmdarg->db;
   sqlite3_stmt *stmt;
   char *query;
   uint8_t *data;
@@ -1427,10 +1442,10 @@ cache_artwork_add_impl(void *arg, int *retval)
 
   query = "INSERT INTO artwork (id, persistentid, max_w, max_h, format, filepath, db_timestamp, data, type) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?);";
 
-  ret = sqlite3_prepare_v2(cmdarg->hdl, query, -1, &stmt, 0);
+  ret = sqlite3_prepare_v2(db->hdl, query, -1, &stmt, 0);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_CACHE, "Could not prepare statement: %s\n", sqlite3_errmsg(cmdarg->hdl));
+      DPRINTF(E_LOG, L_CACHE, "Could not prepare statement: %s\n", sqlite3_errmsg(db->hdl));
       *retval = -1;
       return COMMAND_END;
     }
@@ -1450,7 +1465,7 @@ cache_artwork_add_impl(void *arg, int *retval)
   ret = sqlite3_step(stmt);
   if (ret != SQLITE_DONE)
     {
-      DPRINTF(E_LOG, L_CACHE, "Error stepping query for artwork add: %s\n", sqlite3_errmsg(cmdarg->hdl));
+      DPRINTF(E_LOG, L_CACHE, "Error stepping query for artwork add: %s\n", sqlite3_errmsg(db->hdl));
       sqlite3_finalize(stmt);
       *retval = -1;
       return COMMAND_END;
@@ -1459,7 +1474,7 @@ cache_artwork_add_impl(void *arg, int *retval)
   ret = sqlite3_finalize(stmt);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_CACHE, "Error finalizing query for artwork add: %s\n", sqlite3_errmsg(cmdarg->hdl));
+      DPRINTF(E_LOG, L_CACHE, "Error finalizing query for artwork add: %s\n", sqlite3_errmsg(db->hdl));
       *retval = -1;
       return COMMAND_END;
     }
@@ -1488,6 +1503,7 @@ cache_artwork_get_impl(void *arg, int *retval)
 {
 #define Q_TMPL "SELECT a.format, a.data FROM artwork a WHERE a.type = %d AND a.persistentid = %" PRIi64 " AND a.max_w = %d AND a.max_h = %d;"
   struct cache_arg *cmdarg = arg;
+  struct cache_db *db = cmdarg->db;
   sqlite3_stmt *stmt;
   char *query;
   int datalen;
@@ -1503,10 +1519,10 @@ cache_artwork_get_impl(void *arg, int *retval)
 
   DPRINTF(E_DBG, L_CACHE, "Running query '%s'\n", query);
 
-  ret = sqlite3_prepare_v2(cmdarg->hdl, query, -1, &stmt, 0);
+  ret = sqlite3_prepare_v2(db->hdl, query, -1, &stmt, 0);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_CACHE, "Could not prepare statement: %s\n", sqlite3_errmsg(cmdarg->hdl));
+      DPRINTF(E_LOG, L_CACHE, "Could not prepare statement: %s\n", sqlite3_errmsg(db->hdl));
       ret = -1;
       goto error_get;
     }
@@ -1524,7 +1540,7 @@ cache_artwork_get_impl(void *arg, int *retval)
       else
 	{
 	  ret = -1;
-	  DPRINTF(E_LOG, L_CACHE, "Could not step: %s\n", sqlite3_errmsg(cmdarg->hdl));
+	  DPRINTF(E_LOG, L_CACHE, "Could not step: %s\n", sqlite3_errmsg(db->hdl));
 	}
 
       goto error_get;
@@ -1551,7 +1567,7 @@ cache_artwork_get_impl(void *arg, int *retval)
 
   ret = sqlite3_finalize(stmt);
   if (ret != SQLITE_OK)
-    DPRINTF(E_LOG, L_CACHE, "Error finalizing query for getting cache: %s\n", sqlite3_errmsg(cmdarg->hdl));
+    DPRINTF(E_LOG, L_CACHE, "Error finalizing query for getting cache: %s\n", sqlite3_errmsg(db->hdl));
 
   DPRINTF(E_DBG, L_CACHE, "Cache hit: %s\n", query);
 
@@ -1717,7 +1733,7 @@ cache_daap_get(struct evbuffer *evbuf, const char *query)
   if (!cache_is_initialized)
     return -1;
 
-  cmdarg.hdl = cache_daap_hdl;
+  cmdarg.db = &cache_daap_db;
   cmdarg.query = strdup(query);
   cmdarg.evbuf = evbuf;
 
@@ -1739,7 +1755,7 @@ cache_daap_add(const char *query, const char *ua, int is_remote, int msec)
       return;
     }
 
-  cmdarg->hdl = cache_daap_hdl;
+  cmdarg->db = &cache_daap_db;
   cmdarg->query = strdup(query);
   cmdarg->ua = strdup(ua);
   cmdarg->is_remote = is_remote;
@@ -1766,7 +1782,7 @@ cache_xcode_header_get(struct evbuffer *evbuf, int *cached, uint32_t id, const c
   if (!cache_is_initialized)
     return -1;
 
-  cmdarg.hdl = cache_xcode_hdl;
+  cmdarg.db = &cache_xcode_db;
   cmdarg.evbuf = evbuf;
   cmdarg.id = id;
   cmdarg.header_format = format;
@@ -1817,7 +1833,7 @@ cache_artwork_ping(const char *path, time_t mtime, int del)
       return;
     }
 
-  cmdarg->hdl = cache_artwork_hdl;
+  cmdarg->db = &cache_artwork_db;
   cmdarg->pathcopy = strdup(path);
   cmdarg->mtime = mtime;
   cmdarg->del = del;
@@ -1839,7 +1855,7 @@ cache_artwork_delete_by_path(const char *path)
   if (!cache_is_initialized)
     return -1;
 
-  cmdarg.hdl = cache_artwork_hdl;
+  cmdarg.db = &cache_artwork_db;
   cmdarg.path = path;
 
   return commands_exec_sync(cmdbase, cache_artwork_delete_by_path_impl, NULL, &cmdarg);
@@ -1859,7 +1875,7 @@ cache_artwork_purge_cruft(time_t ref)
   if (!cache_is_initialized)
     return -1;
 
-  cmdarg.hdl = cache_artwork_hdl;
+  cmdarg.db = &cache_artwork_db;
   cmdarg.mtime = ref;
 
   return commands_exec_sync(cmdbase, cache_artwork_purge_cruft_impl, NULL, &cmdarg);
@@ -1885,7 +1901,7 @@ cache_artwork_add(int type, int64_t persistentid, int max_w, int max_h, int form
   if (!cache_is_initialized)
     return -1;
 
-  cmdarg.hdl = cache_artwork_hdl;
+  cmdarg.db = &cache_artwork_db;
   cmdarg.type = type;
   cmdarg.persistentid = persistentid;
   cmdarg.max_w = max_w;
@@ -1924,7 +1940,7 @@ cache_artwork_get(int type, int64_t persistentid, int max_w, int max_h, int *cac
       return 0;
     }
 
-  cmdarg.hdl = cache_artwork_hdl;
+  cmdarg.db = &cache_artwork_db;
   cmdarg.type = type;
   cmdarg.persistentid = persistentid;
   cmdarg.max_w = max_w;
