@@ -1133,7 +1133,7 @@ xcode_header_save(sqlite3 *hdl, int file_id, const char *format, uint8_t *data, 
   ret = sqlite3_prepare_v2(hdl, Q_TMPL, -1, &stmt, 0);
   if (ret != SQLITE_OK)
     {
-      DPRINTF(E_LOG, L_CACHE, "Error preparing xcode_data for cache update: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_CACHE, "Error preparing xcode data for cache update: %s\n", sqlite3_errmsg(hdl));
       return -1;
     }
 
@@ -1145,7 +1145,7 @@ xcode_header_save(sqlite3 *hdl, int file_id, const char *format, uint8_t *data, 
   ret = sqlite3_step(stmt);
   if (ret != SQLITE_DONE)
     {
-      DPRINTF(E_LOG, L_CACHE, "Error stepping xcode_data for cache update: %s\n", sqlite3_errmsg(hdl));
+      DPRINTF(E_LOG, L_CACHE, "Error stepping xcode data for cache update: %s\n", sqlite3_errmsg(hdl));
       return -1;
     }
 
@@ -1193,11 +1193,16 @@ static void
 xcode_worker(void *arg)
 {
   struct cache_xcode_job *job = *(struct cache_xcode_job **)arg;
+  int ret;
 
   DPRINTF(E_DBG, L_CACHE, "Preparing %s header for '%s' (file id %d)\n", job->format, job->file_path, job->file_id);
 
   if (strcmp(job->format, CACHE_XCODE_FORMAT_MP4) == 0)
-    transcode_prepare_header(&job->header, XCODE_MP4_ALAC, job->file_path);
+    {
+      ret = transcode_prepare_header(&job->header, XCODE_MP4_ALAC, job->file_path);
+      if (ret < 0)
+	DPRINTF(E_LOG, L_CACHE, "Error preparing %s header for '%s' (file id %d)\n", job->format, job->file_path, job->file_id);
+    }
 
   // Tell the cache thread that we are done. Only the cache thread can save the
   // result to the DB.
@@ -1221,10 +1226,6 @@ cache_xcode_job_complete_cb(int fd, short what, void *arg)
       datalen = 6;
 #endif
       xcode_header_save(cache_xcode_hdl, job->file_id, job->format, data, datalen);
-    }
-  else
-    {
-      DPRINTF(E_WARN, L_CACHE, "Error preparing %s header for '%s' (file id %d)\n", job->format, job->file_path, job->file_id);
     }
 
   xcode_job_clear(job); // Makes the job available again
